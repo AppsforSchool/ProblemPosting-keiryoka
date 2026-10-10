@@ -1,4 +1,4 @@
-import { firestoreTransport, firestoreCacheMode, authStorageMode, hedged, auth, db, rtdb, onAuthStateChanged, signOut, collection, doc, getDoc, getDocs, setDoc, query, orderBy, serverTimestamp, rtdbRef, rtdbGet, rtdbSet, rtdbServerTimestamp, onChildAdded, onChildChanged, onChildRemoved } from "./firebase.js";
+import { updateDoc, firestoreTransport, firestoreCacheMode, authStorageMode, hedged, auth, db, rtdb, onAuthStateChanged, signOut, collection, doc, getDoc, getDocs, setDoc, query, orderBy, serverTimestamp, rtdbRef, rtdbGet, rtdbSet, rtdbServerTimestamp, onChildAdded, onChildChanged, onChildRemoved } from "./firebase.js";
 import { setLoadingStage, watchLoadingStall, finishLoading, createReadTracker } from "./loading.js";
 import { perfMark, perfStart, perfNote } from "./perf.js";
 import { initPush, logoutPush, setupPushButton, sendPushToAllOthers } from "./notify.js";
@@ -2051,7 +2051,7 @@ async function openImpressionsModal(bookId, type) {
   impressionsModal.classList.remove("hidden");
 
   try {
-    const bookSnap = await getContentDocRef(bookId, type).get();
+    const bookSnap = await hedged(() => getDoc(getContentDocRef(bookId, type)));
     const impressions = (bookSnap.exists() && bookSnap.data().impressions) || {};
     const entries = Object.entries(impressions).filter(([, text]) => text && text.trim() !== "");
 
@@ -2150,7 +2150,7 @@ async function saveImpressionEdit() {
   impressionEditSaveButton.textContent = "保存中...";
 
   try {
-    await getContentDocRef(impressionEditBookId, impressionEditType).update({
+    await updateDoc(getContentDocRef(impressionEditBookId, impressionEditType), {
       [`impressions.${impressionEditTargetUserId}`]: text
     });
 
