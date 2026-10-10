@@ -76,6 +76,23 @@ body {
   font-size: 0.9rem;
   color: rgba(255, 255, 255, 0.75);
 }
+
+.loading-progress-bar {
+  width: 200px;
+  max-width: 70vw;
+  height: 3px;
+  border-radius: var(--radius-full);
+  background-color: rgba(255, 255, 255, 0.2);
+  overflow: hidden;
+  margin-top: 0.3rem;
+}
+.loading-progress-bar-fill {
+  width: 0%;
+  height: 100%;
+  background-color: #fff;
+  border-radius: var(--radius-full);
+  transition: width 0.25s var(--ease);
+}
 #loading-overlay.hidden {
   display: none;
 }
@@ -305,6 +322,21 @@ body {
   font-size: 1.05rem;
   letter-spacing: 0.01em;
 }
+#app-header #title-area #header-title .rainbow {
+  background: linear-gradient(
+    90deg,
+    #ff5a5a, #ffbc41, #f5f551, #5eff5e, #84a1ff, #ff45ff, #ff5a5a
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: wave 2s linear infinite;
+}
+#app-header #title-area #header-title .header-title-suffix {
+  font-size: 0.9em;
+}
 #user-data {
   display: flex;
   align-items: center;
@@ -460,11 +492,27 @@ body {
 
   text-align: left;
 
+  gap: 8px;
+}
+#setting-solved-by-container {
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   padding-bottom: 1rem;
   margin-bottom: 1rem;
   border-bottom: 1px solid var(--border);
-
-  gap: 8px;
+}
+#setting-solved-by-container:empty {
+  padding-bottom: 0;
+  margin-bottom: 0;
+  border-bottom: none;
+}
+#setting-solved-by-container .card-dates {
+  margin-top: 0;
+}
+#setting-solved-by-container .solved-by-area {
+  margin-top: 0;
 }
 #setting-title {
   font-weight: bold;
@@ -536,6 +584,90 @@ body {
   font-weight: bold;
   color: var(--text);
   white-space: pre-line;
+}
+.recruit-comment-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.3rem;
+}
+.recruit-comment-header .recruit-comment-label {
+  margin-bottom: 0;
+}
+.recruit-comment-edit-button {
+  font-family: "BIZ UDGothic", sans-serif;
+  font-weight: 700;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.65rem;
+  cursor: pointer;
+  background-color: var(--surface);
+  color: var(--primary-dark);
+  border: 1.5px solid rgba(var(--primary-rgb), 0.4);
+  border-radius: var(--radius-full);
+  transition: background-color 0.2s var(--ease);
+}
+.recruit-comment-edit-button:hover {
+  background-color: var(--primary-soft);
+}
+.recruit-comment-edit-button.hidden {
+  display: none;
+}
+.recruit-comment-edit-area.hidden {
+  display: none;
+}
+#recruit-comment-edit-input {
+  font-family: "BIZ UDGothic", sans-serif;
+  font-size: 0.9rem;
+  color: var(--text);
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.6rem;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  background-color: var(--surface);
+  box-sizing: border-box;
+  resize: vertical;
+}
+#recruit-comment-edit-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 4px rgba(var(--primary-rgb), 0.15);
+  outline: none;
+}
+.recruit-comment-edit-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.recruit-comment-save-button,
+.recruit-comment-cancel-button {
+  font-family: "BIZ UDGothic", sans-serif;
+  font-weight: 700;
+  font-size: 0.82rem;
+  flex: 1;
+  padding: 0.5rem;
+  cursor: pointer;
+  border-radius: var(--radius-md);
+  transition: background-color 0.2s var(--ease), opacity 0.2s var(--ease);
+}
+.recruit-comment-save-button {
+  background-color: var(--primary);
+  color: #fff;
+  border: none;
+}
+.recruit-comment-save-button:hover:not(:disabled) {
+  background-color: var(--primary-dark);
+}
+.recruit-comment-save-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.recruit-comment-cancel-button {
+  background-color: var(--surface);
+  color: var(--text-muted);
+  border: 1.5px solid var(--border);
+}
+.recruit-comment-cancel-button:hover {
+  background-color: var(--border);
 }
 .recruit-open-button {
   font-family: "BIZ UDGothic", sans-serif;
@@ -700,9 +832,6 @@ body {
   box-shadow: none;
   cursor: not-allowed;
 }
-.private-badge.recruiting-badge {
-  background: linear-gradient(120deg, var(--primary), var(--accent));
-}
 .private-badge.started-badge {
   background: var(--text-muted);
 }
@@ -799,12 +928,33 @@ body {
 .buttons-area .full-width-button {
   width: 100% !important;
 }
-/* ★ 「待機画面へ」(募集中の問題集の主催者用)の時だけ、ライブ周りのボタンと同じグラデーションにする */
-.buttons-area #start-button.full-width-button {
+/* ★ 募集中でも一人で解けるようにするための「スタート」ボタン(solo-start-button)。
+   デフォルトは単独表示(幅100%)。主催者用の「待機画面へ」や参加者用の「参加する」ボタンと
+   並べて表示する時だけ、JS側で split-primary / split-secondary を付け替えて幅を分け合う。 */
+.buttons-area #solo-start-button {
+  width: 100%;
+  background-color: var(--surface-alt);
+  color: var(--text);
+  border: 1.5px solid var(--border);
+  box-shadow: none;
+}
+.buttons-area #solo-start-button:hover:not(:disabled) {
+  background-color: var(--border);
+}
+.buttons-area .split-primary {
+  width: 65% !important;
+}
+.buttons-area .split-secondary {
+  width: 35% !important;
+}
+/* ★ 「待機画面へ」(募集中の問題集の主催者用)の時だけ、ライブ周りのボタンと同じグラデーションにする。
+   full-width-buttonは単なる横幅100%指定の汎用クラス(編集ボタンが無いだけの通常ユーザーにも付与される)なので、
+   グラデーションはこの専用クラス(live-gradient-button)にだけ適用し、混同しないようにする */
+.buttons-area #start-button.live-gradient-button {
   background: linear-gradient(120deg, var(--primary), var(--accent));
   box-shadow: 0 6px 18px rgba(var(--primary-rgb), 0.35);
 }
-.buttons-area #start-button.full-width-button:hover:not(:disabled) {
+.buttons-area #start-button.live-gradient-button:hover:not(:disabled) {
   background: linear-gradient(120deg, var(--primary-dark), var(--accent));
 }
 
@@ -1056,7 +1206,7 @@ body {
   display: flex;
   gap: 10px;
   align-items: stretch;
-  margin-bottom: 1rem;
+  margin-bottom: 2rem; /* ★ 問題集一覧エリアとの間隔を少し広げた(元は1rem) */
 }
 .narrow-down-area p {
   font-weight: bold;
@@ -1119,7 +1269,8 @@ body {
 .card-area {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 1.2rem;
+  row-gap: 1.8rem; /* ★ カード同士の縦の間隔を少し広げた(元はgap:1.2remで縦横共通だった) */
+  column-gap: 1.2rem;
   max-width: 1200px;
   margin: 0 auto;
   padding: 1rem 1.5rem 2.5rem;
@@ -1151,9 +1302,67 @@ body {
   border-color: rgba(var(--primary-rgb), 0.35);
   transform: translateY(-1px);
 }
+.card-wrapper {
+  position: relative; /* ★ 吹き出しをabsoluteで浮かせるための基準にする */
+  /* ★ ここにheight:100%を書くとグリッドのデフォルトのstretch(高さautoの要素にのみ効く)が
+       むしろ効かなくなってしまうため、高さ指定はせずautoのままにしておく */
+}
+.card-wrapper .card {
+  height: 100%; /* ★ card-wrapperはグリッドのstretchで行の高さいっぱいに伸びるが、中のcard本体は
+                     自分の内容分の高さしか取らないため余白ができてしまっていた。card側にも高さ100%を
+                     指定して、隣の非募集中カード(本体そのものがグリッドの行いっぱいに伸びる)と
+                     本体の高さを揃える */
+}
+.recruit-bubble {
+  /* ★ absoluteにしてカードの上に少し重ねる形にすることで、吹き出しの分の高さが
+       card-wrapperの高さ(=グリッドの行の高さ)に影響しないようにしている。
+       これにより、隣に非募集中のカードが並んだ場合でも、募集中カード側だけが
+       吹き出しの分だけ余計に高さを取られることがなくなる */
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  width: 88%;
+  transform: translateX(-50%);
+  margin-bottom: -14px; /* カードに少しだけ重なるようにする */
+  box-sizing: border-box;
+  background: linear-gradient(120deg, var(--primary), var(--accent));
+  border-radius: var(--radius-md);
+  padding: 0.55rem 0.75rem 0.65rem;
+  box-shadow: var(--shadow-sm);
+  z-index: 2;
+}
+.recruit-bubble::after {
+  /* ★ 矢印はバブル中央下に配置。グラデーションだと繋ぎ目が不自然になったため単色に変更 */
+  content: "";
+  position: absolute;
+  bottom: -8px;
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-left: 8px solid transparent;
+  border-right: 8px solid transparent;
+  border-top: 10px solid #9163C4;
+  transform: translateX(-50%);
+}
+.recruit-bubble-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #fff;
+  text-align: left;
+  margin-bottom: 0.25rem;
+}
+.recruit-bubble-message {
+  font-size: 0.85rem;
+  font-weight: bold;
+  color: #fff;
+  text-align: left;
+  white-space: pre-line;
+  overflow-wrap: break-word;
+}
 .private-badge {
   position: absolute;
-  top: -0.5rem;
+  top: -1rem;
   right: -0.5rem;
   z-index: 1;
 
@@ -1266,6 +1475,12 @@ body {
 
   font-weight: bold;
 }
+.card-dates {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  margin-top: -0.3rem;
+}
 .clickable-user {
   cursor: pointer;
   transition: opacity 0.15s var(--ease);
@@ -1348,6 +1563,10 @@ body {
 .solved-by-avatar {
   border: 2px solid var(--surface-alt);
   margin-left: -0.6rem;
+}
+/* ★ 問題集モーダル内(背景が白)では、カード一覧(背景がsurface-alt)と輪郭の色を合わせて馴染ませる */
+#setting-solved-by-container .solved-by-avatar {
+  border-color: var(--surface);
 }
 .solved-by-stack .solved-by-avatar:first-child {
   margin-left: 0;
@@ -1746,3 +1965,4 @@ footer p {
     width: 100%;
   }
 }
+
