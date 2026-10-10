@@ -1,0 +1,239 @@
+<html lang="ja">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>みんなで解く - 進行管理</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="icon" type="image/png" href="icon-512.png">
+  <link rel="apple-touch-icon" href="icon-512.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=BIZ+UDGothic:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Signika+Negative:wght@300..700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="liveStyle.css">
+
+  <link rel="manifest" href="manifest.json">
+  <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+</head>
+
+<body class="host-body">
+  <div id="loading-overlay">
+    <h1>loading...</h1>
+    <p id="loading-status-text">読み込んでいます｡</p>
+    <div id="loading-progress-bar" class="loading-progress-bar">
+      <div id="loading-progress-bar-fill" class="loading-progress-bar-fill"></div>
+    </div>
+  </div>
+
+  <div id="no-permission-overlay" class="hidden">
+    <h1>アクセスできません</h1>
+    <p>この問題集の主催者のみアクセスできます。</p>
+    <a href="./app.html" class="live-next-button">ホームにもどる</a>
+  </div>
+
+  <header id="live-header">
+    <button id="home-return-button" class="home-icon-button" aria-label="ホームに戻る">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg">
+        <path d="M4 11.5L12 4l8 7.5"/>
+        <path d="M6 10v9a1 1 0 0 0 1 1h3v-5h4v5h3a1 1 0 0 0 1-1v-9"/>
+      </svg>
+    </button>
+    <span class="live-header-badge">HOST</span>
+    <p id="host-title-text">loading...</p>
+    <button id="end-live-early-button" class="end-live-early-button hidden" aria-label="ライブを中止する">中止</button>
+    <button id="audio-mute-button" class="audio-mute-button" aria-label="音を切り替える"></button>
+  </header>
+
+  <main class="live-main">
+
+    <section id="phase-session-missing" class="live-phase hidden">
+      <p class="live-phase-title">セッション情報が見つかりません</p>
+      <p class="waiting-result-hint">募集を開始した際にライブ用のデータが作成されていなかった可能性があります。募集状態をリセットして、もう一度「みんなで解く」からやり直してください。</p>
+      <button id="reset-session-button" class="live-next-button">募集をリセットしてホームにもどる</button>
+    </section>
+
+    <section id="phase-waiting" class="live-phase hidden">
+      <p class="live-phase-title">参加者を待っています</p>
+      <div id="host-waiting-comment-area" class="host-waiting-comment-area">
+        <div class="waiting-comment-header">
+          <p class="waiting-comment-label">募集コメント</p>
+          <button id="waiting-comment-edit-button" type="button" class="waiting-comment-edit-button">編集</button>
+        </div>
+        <p id="waiting-comment-text" class="waiting-comment-text-value"></p>
+        <div id="waiting-comment-edit-area" class="waiting-comment-edit-area hidden">
+          <textarea id="waiting-comment-edit-input" rows="3" maxlength="100" placeholder="例: 今からみんなで解きましょう！"></textarea>
+          <div class="waiting-comment-edit-actions">
+            <button id="waiting-comment-save-button" type="button" class="waiting-comment-save-button">保存する</button>
+            <button id="waiting-comment-cancel-button" type="button" class="waiting-comment-cancel-button">キャンセル</button>
+          </div>
+        </div>
+      </div>
+
+      <p class="waiting-time-limit-label">1問あたりの制限時間</p>
+      <div id="waiting-time-limit-options" class="time-limit-options">
+        <button type="button" class="time-limit-option" data-value="5">5</button>
+        <button type="button" class="time-limit-option" data-value="10">10</button>
+        <button type="button" class="time-limit-option active" data-value="20">20</button>
+        <button type="button" class="time-limit-option" data-value="30">30</button>
+        <button type="button" class="time-limit-option" data-value="60">60</button>
+        <button type="button" class="time-limit-option" data-value="0">∞</button>
+      </div>
+
+      <p class="waiting-count-text">参加者 <span id="waiting-participants-count">0</span> 人</p>
+      <div id="waiting-participants-list" class="participants-list"></div>
+      <button id="start-session-button" class="live-next-button start-button-glow">スタート</button>
+      <button id="waiting-share-button" class="live-secondary-button">シェア</button>
+      <button id="cancel-recruitment-button" class="live-secondary-button">ライブを中止する</button>
+    </section>
+
+    <section id="phase-countdown" class="live-phase hidden">
+      <p class="countdown-label">まもなく開始します</p>
+      <p id="countdown-number" class="countdown-number">3</p>
+    </section>
+
+    <section id="phase-question" class="live-phase hidden">
+      <div class="question-top-row">
+        <p id="question-index-text" class="question-index-text"></p>
+        <p id="question-answered-count" class="question-answered-count"></p>
+      </div>
+      <div class="timer-bar-track">
+        <div id="question-timer-bar" class="timer-bar-fill"></div>
+      </div>
+      <p id="question-timer-text" class="question-timer-text"></p>
+
+      <p id="host-question-text" class="host-question-text"></p>
+      <img id="host-question-image" class="host-question-image hidden" alt="問題の画像">
+
+      <div class="host-display-toggles">
+        <label class="host-toggle-row">
+          <span class="toggle-switch">
+            <input type="checkbox" id="show-answer-status-toggle">
+            <span class="toggle-switch-track"></span>
+          </span>
+          <span>解答状況を表示する</span>
+        </label>
+        <label class="host-toggle-row">
+          <span class="toggle-switch">
+            <input type="checkbox" id="show-correct-answer-toggle">
+            <span class="toggle-switch-track"></span>
+          </span>
+          <span>解答を表示する</span>
+        </label>
+      </div>
+
+      <p id="answer-status-heading" class="answer-status-heading">解答状況</p>
+      <div id="answer-status-area" class="answer-status-area"></div>
+
+      <button id="cutoff-button" class="live-secondary-button">この問題の受付を締め切る</button>
+    </section>
+
+    <section id="phase-grading" class="live-phase hidden">
+      <p class="live-phase-title">記述式の採点</p>
+      <p id="grading-hint-text" class="grading-hint-text"></p>
+      <div id="grading-submissions-area" class="grading-submissions-area"></div>
+      <p id="grading-error-text" class="grading-error-text hidden"></p>
+      <button id="request-ai-grading-button" class="live-next-button">AIに一括採点を依頼</button>
+      <button id="manual-grading-button" class="live-secondary-button">手動で採点する</button>
+    </section>
+
+    <section id="phase-results" class="live-phase hidden">
+      <p class="live-phase-title">この問題の結果</p>
+      <div id="results-correct-area" class="results-correct-area"></div>
+      <p class="leaderboard-heading">現在の順位</p>
+      <div id="results-leaderboard-area" class="leaderboard-area"></div>
+      <button id="next-question-button" class="live-next-button">次の問題へ</button>
+    </section>
+
+    <section id="phase-finished" class="live-phase hidden">
+      <p class="live-phase-title finished-title">結果発表</p>
+      <div id="finished-leaderboard-area" class="leaderboard-area"></div>
+      <div id="finished-buttons-area" class="finished-buttons-area hidden">
+        <button id="finished-home-button" class="live-next-button">ライブを終了する</button>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="live-share-modal" class="modal-overlay hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <p class="title">この問題集をシェア</p>
+        <span id="live-share-modal-close" class="close-button">&times;</span>
+      </div>
+      <div class="live-share-qr-wrap">
+        <div id="live-share-qr" class="live-share-qr"></div>
+      </div>
+      <p id="live-share-url" class="live-share-url"></p>
+    </div>
+  </div>
+
+  <div id="answer-status-names-modal" class="modal-overlay hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <p id="answer-status-names-title" class="title"></p>
+        <span id="answer-status-names-modal-close" class="close-button">&times;</span>
+      </div>
+      <div id="answer-status-names-area" class="answer-status-names-area"></div>
+    </div>
+  </div>
+
+  <div id="manual-grading-modal" class="modal-overlay hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <p class="title">手動採点</p>
+        <span id="manual-grading-modal-close" class="close-button">&times;</span>
+      </div>
+
+      <div id="manual-grading-ai-ready-banner" class="manual-grading-ai-ready-banner hidden">
+        <p>AI採点が終了しました。AIによる採点結果を返却しますか？</p>
+        <button id="manual-grading-use-ai-result-button" class="live-next-button">AI採点結果を返却</button>
+      </div>
+
+      <div class="manual-grading-reference-area">
+        <p class="manual-grading-label">採点基準</p>
+        <p id="manual-grading-criteria-text" class="manual-grading-reference-text"></p>
+        <p class="manual-grading-label">模範解答</p>
+        <p id="manual-grading-model-answer-text" class="manual-grading-reference-text"></p>
+      </div>
+
+      <p id="manual-grading-progress-text" class="manual-grading-progress-text"></p>
+
+      <div class="manual-grading-submission-area">
+        <p id="manual-grading-submission-name" class="manual-grading-submission-name"></p>
+        <p id="manual-grading-submission-text" class="manual-grading-submission-text"></p>
+      </div>
+
+      <div class="manual-grading-score-area">
+        <p class="manual-grading-score-label">点数: <span id="manual-grading-score-value">5</span> / 10</p>
+        <input type="range" id="manual-grading-score-slider" class="manual-grading-score-slider" min="0" max="10" step="1" value="5">
+      </div>
+
+      <div class="manual-grading-nav-actions">
+        <button id="manual-grading-prev-button" class="live-secondary-button">戻る</button>
+        <button id="manual-grading-next-button" class="live-next-button">次へ</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="app-dialog-modal" class="modal-overlay hidden">
+    <div class="modal-content app-dialog-content">
+      <p id="app-dialog-title" class="app-dialog-title hidden"></p>
+      <p id="app-dialog-message" class="app-dialog-message"></p>
+      <div class="app-dialog-actions">
+        <button id="app-dialog-ok-button" class="live-next-button">OK</button>
+        <button id="app-dialog-cancel-button" class="live-secondary-button hidden">キャンセル</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/qr-code-styling@1.5.0/lib/qr-code-styling.js"></script>
+
+  <script src="liveAudio.js"></script>
+  <script src="liveDialog.js"></script>
+  <script type="module" src="liveHostScript.js"></script>
+</body>
+</html>

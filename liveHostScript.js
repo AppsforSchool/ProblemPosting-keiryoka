@@ -1,0 +1,1688 @@
+import { hedged, auth, db, rtdb, onAuthStateChanged, collection, doc, getDoc, getDocs, setDoc, updateDoc, query, orderBy, serverTimestamp, arrayUnion, rtdbRef, rtdbGet, rtdbSet, rtdbUpdate, rtdbServerTimestamp, onValue } from "./firebase.js";
+import { setLoadingStage, watchLoadingStall, finishLoading, createReadTracker } from "./loading.js";
+import { perfMark, perfStart, perfNote } from "./perf.js";
+import { initPush } from "./notify.js";
+
+perfMark("JSモジュールの読み込み・実行開始（HTML解析・Firebase等の取得）");
+let loadingFinished = false; // ★ RTDBのリスナーは何度も呼ばれるので、読み込み完了の処理は最初の1回だけにする
+
+// ★ 参加者/主催者の名前を、管理者/景品保持者なら虹色で表示するためのキャッシュ・判定ロジック。
+//   appScript.js/profileSystem.js側と同じ考え方(値は揃える)を、このページ用に単体で持たせている
+const userInfoCache = {};
+const PRIZE_DURATION_MS = 10 * 60 * 1000; // 10分間
+
+function toMillisOrNull(value) {
+  if (!value) return null;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value === "number") return value;
+  return null;
+}
+function hasActivePrize(cached) {
+  const grantedAt = cached && cached.prizeGrantedAt;
+  return typeof grantedAt === "number" && grantedAt + PRIZE_DURATION_MS > Date.now();
+}
+async function ensureUserInfo(userId) {
+  if (userInfoCache[userId]) return userInfoCache[userId];
+  try {
+    const snap = await hedged(() => getDoc(doc(db, "users_random", userId)));
+    const data = snap.exists() ? snap.data() : {};
+    userInfoCache[userId] = { isAdmin: !!data.isAdmin, prizeGrantedAt: toMillisOrNull(data.prizeGrantedAt) };
+  } catch (error) {
+    console.error("ユーザー情報の取得に失敗しました:", error);
+    userInfoCache[userId] = { isAdmin: false, prizeGrantedAt: null };
+  }
+  return userInfoCache[userId];
+}
+// ★ 名前を表示する要素に、管理者/景品保持者なら虹色クラスを付与する。
+//   まだ情報が無ければ取得してから改めて反映する(取得完了時にはその要素が無くなっている場合もあるため、
+//   呼び出し側は毎回の再描画でこの関数を呼び直せば十分)
+function applyRainbowNameClass(el, userId) {
+  if (!el || !userId) return;
+  const cached = userInfoCache[userId];
+  if (cached) {
+    el.classList.toggle("admin", cached.isAdmin);
+    el.classList.toggle("prize", !cached.isAdmin && hasActivePrize(cached));
+    return;
+  }
+  ensureUserInfo(userId).then(info => {
+    el.classList.toggle("admin", info.isAdmin);
+    el.classList.toggle("prize", !info.isAdmin && hasActivePrize(info));
+  });
+}
+
+// ★ iPadなどコンソールが見られない環境向けに、想定外のエラーをアラートで表示する
+window.addEventListener("error", event => {
+  const message = (event.error && event.error.message) || event.message || "不明なエラー";
+  console.error("Uncaught error:", event.error || event.message);
+  LiveDialog.alert("予期しないエラーが発生しました:\n" + message);
+});
+window.addEventListener("unhandledrejection", event => {
+  const reason = event.reason;
+  const message = (reason && reason.message) || String(reason);
+  console.error("Unhandled promise rejection:", reason);
+  LiveDialog.alert("予期しないエラーが発生しました:\n" + message);
+});
+
+// ★ 記述式の一括採点に使うGeminiモデル。answerScript.jsと合わせておく。
+//   1日の利用回数などでレート制限にかかることがあるため、複数のモデルを候補として持っておき、
+//   あるモデルで失敗したら次のモデルを順に試す。
+//   (2026年9月時点でGoogleが提供している主要なGeminiモデルから選定。廃止/変更された場合はここを更新する)
+const GEMINI_MODEL_CANDIDATES = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"];
+let geminiApiKeyCache = null;
+
+const BASE_SCORE = 1000;
+
+let myUserId = "";
+let bookId = "";
+let problemsData = []; // [problem, choices, answer, explanation, imageUrl, answerType, shuffleChoices, modelAnswer, gradingCriteria]
+let sessionData = null;
+let sessionRef = null;
+let serverTimeOffset = 0;
+
+let questionTimeoutHandle = null;
+let countdownIntervalHandle = null;
+
+let loadingOverlay;
+let noPermissionOverlay;
+let hostTitleText;
+
+let phaseWaiting, phaseCountdown, phaseQuestion, phaseGrading, phaseResults, phaseFinished, phaseSessionMissing;
+
+let waitingParticipantsList, waitingParticipantsCount, waitingTimeLimitOptions, startSessionButton, cancelRecruitmentButton;
+let waitingCommentText, waitingCommentEditButton, waitingCommentEditArea, waitingCommentEditInput, waitingCommentSaveButton, waitingCommentCancelButton;
+let isEditingWaitingComment = false;
+let selectedTimeLimitSeconds = 20;
+let userChangedTimeLimit = false;
+let countdownNumberEl;
+let questionIndexText, questionText, questionImage, questionTimerText, questionTimerBar, questionAnsweredCount, cutoffButton;
+let answerStatusArea;
+let answerStatusHeading;
+let showAnswerStatusToggle, showCorrectAnswerToggle;
+let showAnswerStatusEnabled = false;
+let showCorrectAnswerEnabled = false;
+let gradingHintText, gradingSubmissionsArea, requestAiGradingButton, gradingErrorText;
+let manualGradingButton, manualGradingModal, manualGradingModalClose;
+let manualGradingCriteriaText, manualGradingModelAnswerText, manualGradingProgressText;
+let manualGradingSubmissionName, manualGradingSubmissionText;
+let manualGradingScoreSlider, manualGradingScoreValue;
+let manualGradingPrevButton, manualGradingNextButton;
+let manualGradingAiReadyBanner, manualGradingUseAiResultButton;
+let manualGradingEntries = []; // [[uid, ans], ...] ★ 手動採点中の解答一覧(今回の問題分)
+let manualGradingScores = {}; // uid -> 0〜10点 ★ 手動採点中にスライダーで決めた点数を一時保持
+let manualGradingCurrentIndex = 0;
+// ★ 手動採点中にAIの採点が裏で終わった場合、勝手に確定せずここに一旦保留しておく
+let pendingAiGradingResult = null; // uid -> {score, reason}
+let pendingAiGradingResultIndex = -1; // どの問題に対する結果かを覚えておく(問題がずれて誤適用されないように)
+let resultsCorrectArea, resultsLeaderboardArea, nextQuestionButton;
+let finishedLeaderboardArea, finishedButtonsArea, finishedHomeButton;
+let audioMuteButton;
+let endLiveEarlyButton;
+let homeReturnButton;
+let liveShareModal, liveShareModalClose, liveShareQr, liveShareUrl, waitingShareButton;
+let answerStatusNamesModal, answerStatusNamesModalClose, answerStatusNamesTitle, answerStatusNamesArea;
+let bgmStarted = false;
+let lastRenderedStatus = null;
+
+function updateAudioMuteButtonLabel() {
+  audioMuteButton.innerHTML = LiveAudio.iconMarkup(LiveAudio.isMuted());
+}
+
+// ★ テーマカラーのグラデーション・角丸モジュールのQRコードを、qr-code-stylingでその場で描画する
+let liveShareQrCode = null;
+function openLiveShareModal(targetBookId) {
+  const targetUrl = new URL(`app.html#${targetBookId}`, window.location.href).href;
+  liveShareUrl.textContent = targetUrl;
+
+  const qrOptions = {
+    width: 200,
+    height: 200,
+    type: "svg",
+    data: targetUrl,
+    margin: 4,
+    qrOptions: { errorCorrectionLevel: "M" },
+    backgroundOptions: { color: "rgba(0,0,0,0)" },
+    dotsOptions: {
+      type: "rounded",
+      gradient: {
+        type: "linear",
+        rotation: Math.PI / 4,
+        colorStops: [
+          { offset: 0, color: "#CE579B" },
+          { offset: 1, color: "#5b6ee8" }
+        ]
+      }
+    },
+    cornersSquareOptions: {
+      type: "extra-rounded",
+      gradient: {
+        type: "linear",
+        rotation: Math.PI / 4,
+        colorStops: [
+          { offset: 0, color: "#CE579B" },
+          { offset: 1, color: "#5b6ee8" }
+        ]
+      }
+    },
+    cornersDotOptions: { type: "dot", color: "#5b6ee8" }
+  };
+
+  if (!liveShareQrCode) {
+    liveShareQrCode = new QRCodeStyling(qrOptions);
+    liveShareQr.innerHTML = "";
+    liveShareQrCode.append(liveShareQr);
+  } else {
+    liveShareQrCode.update(qrOptions);
+  }
+
+  liveShareModal.classList.remove("hidden");
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  loadingOverlay = document.getElementById("loading-overlay");
+  perfMark("DOMContentLoaded（DOM構築完了まで）");
+  setLoadingStage("Firebaseに接続しています｡", 10, 20);
+  watchLoadingStall(); // ★ 読み込みが長引いたら、止まっている段階と復旧ボタンを表示する
+  noPermissionOverlay = document.getElementById("no-permission-overlay");
+  hostTitleText = document.getElementById("host-title-text");
+
+  phaseWaiting = document.getElementById("phase-waiting");
+  phaseCountdown = document.getElementById("phase-countdown");
+  phaseQuestion = document.getElementById("phase-question");
+  phaseGrading = document.getElementById("phase-grading");
+  phaseResults = document.getElementById("phase-results");
+  phaseFinished = document.getElementById("phase-finished");
+  phaseSessionMissing = document.getElementById("phase-session-missing");
+
+  waitingParticipantsList = document.getElementById("waiting-participants-list");
+  waitingParticipantsCount = document.getElementById("waiting-participants-count");
+  waitingCommentText = document.getElementById("waiting-comment-text");
+  waitingCommentEditButton = document.getElementById("waiting-comment-edit-button");
+  waitingCommentEditArea = document.getElementById("waiting-comment-edit-area");
+  waitingCommentEditInput = document.getElementById("waiting-comment-edit-input");
+  waitingCommentSaveButton = document.getElementById("waiting-comment-save-button");
+  waitingCommentCancelButton = document.getElementById("waiting-comment-cancel-button");
+  waitingTimeLimitOptions = document.getElementById("waiting-time-limit-options");
+  startSessionButton = document.getElementById("start-session-button");
+  cancelRecruitmentButton = document.getElementById("cancel-recruitment-button");
+
+  countdownNumberEl = document.getElementById("countdown-number");
+
+  questionIndexText = document.getElementById("question-index-text");
+  questionText = document.getElementById("host-question-text");
+  questionImage = document.getElementById("host-question-image");
+  answerStatusArea = document.getElementById("answer-status-area");
+  answerStatusHeading = document.getElementById("answer-status-heading");
+  showAnswerStatusToggle = document.getElementById("show-answer-status-toggle");
+  showCorrectAnswerToggle = document.getElementById("show-correct-answer-toggle");
+  showAnswerStatusToggle.addEventListener("change", () => {
+    showAnswerStatusEnabled = showAnswerStatusToggle.checked;
+    if (sessionData && sessionData.status === "question") renderQuestionPhase();
+  });
+  showCorrectAnswerToggle.addEventListener("change", () => {
+    showCorrectAnswerEnabled = showCorrectAnswerToggle.checked;
+    if (sessionData && sessionData.status === "question") renderQuestionPhase();
+  });
+  questionTimerText = document.getElementById("question-timer-text");
+  questionTimerBar = document.getElementById("question-timer-bar");
+  questionAnsweredCount = document.getElementById("question-answered-count");
+  cutoffButton = document.getElementById("cutoff-button");
+
+  gradingHintText = document.getElementById("grading-hint-text");
+  gradingSubmissionsArea = document.getElementById("grading-submissions-area");
+  requestAiGradingButton = document.getElementById("request-ai-grading-button");
+  gradingErrorText = document.getElementById("grading-error-text");
+
+  manualGradingButton = document.getElementById("manual-grading-button");
+  manualGradingModal = document.getElementById("manual-grading-modal");
+  manualGradingModalClose = document.getElementById("manual-grading-modal-close");
+  manualGradingCriteriaText = document.getElementById("manual-grading-criteria-text");
+  manualGradingModelAnswerText = document.getElementById("manual-grading-model-answer-text");
+  manualGradingProgressText = document.getElementById("manual-grading-progress-text");
+  manualGradingSubmissionName = document.getElementById("manual-grading-submission-name");
+  manualGradingSubmissionText = document.getElementById("manual-grading-submission-text");
+  manualGradingScoreSlider = document.getElementById("manual-grading-score-slider");
+  manualGradingScoreValue = document.getElementById("manual-grading-score-value");
+  manualGradingPrevButton = document.getElementById("manual-grading-prev-button");
+  manualGradingNextButton = document.getElementById("manual-grading-next-button");
+  manualGradingAiReadyBanner = document.getElementById("manual-grading-ai-ready-banner");
+  manualGradingUseAiResultButton = document.getElementById("manual-grading-use-ai-result-button");
+
+  resultsCorrectArea = document.getElementById("results-correct-area");
+  resultsLeaderboardArea = document.getElementById("results-leaderboard-area");
+  nextQuestionButton = document.getElementById("next-question-button");
+
+  finishedLeaderboardArea = document.getElementById("finished-leaderboard-area");
+  finishedButtonsArea = document.getElementById("finished-buttons-area");
+  finishedHomeButton = document.getElementById("finished-home-button");
+
+  startSessionButton.addEventListener("click", startSession);
+  document.getElementById("reset-session-button").addEventListener("click", resetBrokenSessionAndGoHome);
+  cancelRecruitmentButton.addEventListener("click", () => cancelRecruitment(cancelRecruitmentButton));
+
+  // ★ 待機画面からも、参加者側と同じ募集コメントを見つつ、その場で編集できるようにする
+  waitingCommentEditButton.addEventListener("click", () => {
+    waitingCommentEditInput.value = (sessionData && sessionData.recruitComment) || "";
+    isEditingWaitingComment = true;
+    waitingCommentText.classList.add("hidden");
+    waitingCommentEditButton.classList.add("hidden");
+    waitingCommentEditArea.classList.remove("hidden");
+    waitingCommentEditInput.focus();
+  });
+  waitingCommentCancelButton.addEventListener("click", () => {
+    isEditingWaitingComment = false;
+    waitingCommentEditArea.classList.add("hidden");
+    waitingCommentEditButton.classList.remove("hidden");
+    const comment = (sessionData && sessionData.recruitComment ? sessionData.recruitComment : "").trim();
+    waitingCommentText.textContent = comment || "(コメントはありません)";
+    waitingCommentText.classList.remove("hidden");
+  });
+  waitingCommentSaveButton.addEventListener("click", async () => {
+    const newComment = waitingCommentEditInput.value.trim();
+    waitingCommentSaveButton.disabled = true;
+    waitingCommentCancelButton.disabled = true;
+    try {
+      await rtdbSet(rtdbRef(sessionRef, "recruitComment"), newComment);
+      isEditingWaitingComment = false;
+      waitingCommentText.textContent = newComment || "(コメントはありません)";
+      waitingCommentText.classList.remove("hidden");
+      waitingCommentEditArea.classList.add("hidden");
+      waitingCommentEditButton.classList.remove("hidden");
+    } catch (error) {
+      console.error("募集コメントの更新に失敗しました:", error);
+      LiveDialog.alert("募集コメントの更新に失敗しました。\n" + error);
+    } finally {
+      waitingCommentSaveButton.disabled = false;
+      waitingCommentCancelButton.disabled = false;
+    }
+  });
+
+  Array.from(waitingTimeLimitOptions.children).forEach(button => {
+    button.addEventListener("click", () => {
+      userChangedTimeLimit = true;
+      selectedTimeLimitSeconds = Number(button.dataset.value) || 0;
+      Array.from(waitingTimeLimitOptions.children).forEach(b => b.classList.toggle("active", b === button));
+    });
+  });
+  cutoffButton.addEventListener("click", () => lockQuestion());
+  requestAiGradingButton.addEventListener("click", requestAiGrading);
+  manualGradingButton.addEventListener("click", openManualGradingModal);
+  manualGradingModalClose.addEventListener("click", closeManualGradingModal);
+  manualGradingModal.addEventListener("click", event => {
+    if (event.target === manualGradingModal) closeManualGradingModal();
+  });
+  manualGradingScoreSlider.addEventListener("input", () => {
+    manualGradingScoreValue.textContent = manualGradingScoreSlider.value;
+  });
+  manualGradingPrevButton.addEventListener("click", () => stepManualGrading(-1));
+  manualGradingNextButton.addEventListener("click", () => stepManualGrading(1));
+  manualGradingUseAiResultButton.addEventListener("click", useAiGradingResult);
+  nextQuestionButton.addEventListener("click", handleNextButton);
+  finishedHomeButton.addEventListener("click", handleEndLiveClick);
+
+  endLiveEarlyButton = document.getElementById("end-live-early-button");
+  homeReturnButton = document.getElementById("home-return-button");
+  endLiveEarlyButton.addEventListener("click", () => cancelRecruitment(endLiveEarlyButton));
+  // ★ 参加取り消し・中止とは別の、セッションはそのままにして単にホームへ戻るボタン。
+  //   主催者が離脱すると誰も進行できなくなるため、一言確認してから移動する
+  homeReturnButton.addEventListener("click", async () => {
+    const confirmed = await LiveDialog.confirm(
+      "ホームに戻りますか？\nライブはこのまま継続され、あなたがいない間は進行できません。"
+    );
+    if (confirmed) window.location.href = "./app.html";
+  });
+
+  audioMuteButton = document.getElementById("audio-mute-button");
+  updateAudioMuteButtonLabel();
+  audioMuteButton.addEventListener("click", () => {
+    LiveAudio.toggleMuted();
+    updateAudioMuteButtonLabel();
+  });
+
+  liveShareModal = document.getElementById("live-share-modal");
+  liveShareModalClose = document.getElementById("live-share-modal-close");
+  liveShareQr = document.getElementById("live-share-qr");
+  liveShareUrl = document.getElementById("live-share-url");
+  waitingShareButton = document.getElementById("waiting-share-button");
+  waitingShareButton.addEventListener("click", () => openLiveShareModal(bookId));
+  liveShareModalClose.addEventListener("click", () => {
+    liveShareModal.classList.add("hidden");
+  });
+
+  answerStatusNamesModal = document.getElementById("answer-status-names-modal");
+  answerStatusNamesModalClose = document.getElementById("answer-status-names-modal-close");
+  answerStatusNamesTitle = document.getElementById("answer-status-names-title");
+  answerStatusNamesArea = document.getElementById("answer-status-names-area");
+  answerStatusNamesModalClose.addEventListener("click", () => {
+    answerStatusNamesModal.classList.add("hidden");
+  });
+  answerStatusNamesModal.addEventListener("click", event => {
+    if (event.target === answerStatusNamesModal) answerStatusNamesModal.classList.add("hidden");
+  });
+
+  onValue(rtdbRef(rtdb, ".info/serverTimeOffset"), snap => {
+    serverTimeOffset = snap.val() || 0;
+  });
+
+  onAuthStateChanged(auth, async user => {
+    if (!user) {
+      window.location.href = "./index.html";
+      return;
+    }
+    myUserId = user.email.split("@")[0];
+    perfMark("ログイン状態の確定（Firebase Auth）");
+    // ★ プッシュ通知の初期化（失敗しても画面の表示には影響させない。結果は待たない）
+    const endPushPerf = perfStart("OneSignal初期化（キー取得・SDK・login）");
+    Promise.resolve(initPush(db, myUserId)).then(endPushPerf, endPushPerf);
+
+    bookId = getParmFromUrl("id");
+    if (!bookId) {
+      LiveDialog.alert("問題集が指定されていません。");
+      window.location.href = "./app.html";
+      return;
+    }
+
+    try {
+      // ★ 問題集の情報と問題の一覧は互いに依存しない(主催者かどうかの判定は取得後に行う)ので、同時に発行する
+      setLoadingStage("問題集・問題を読み込んでいます｡", 15, 55);
+      const trackRead = createReadTracker(2, 15, 55);
+      const bookSnapshotPromise = trackRead("問題集の情報", hedged(() => getDoc(doc(db, "ProblemPosting", "books", "data", bookId))));
+      const problemsSnapshotPromise = trackRead("問題", hedged(() => getDocs(query(collection(db, "ProblemPosting", "books", "data", bookId, "problems"), orderBy("no")))));
+      bookSnapshotPromise.catch(() => {});
+      problemsSnapshotPromise.catch(() => {}); // ★ 権限が無くて使われないまま失敗しても、未処理のエラーとして残さない
+
+      const ok = await loadBookAndVerifyHost(bookSnapshotPromise);
+      perfMark("問題集の情報の到着待ち（Firestore）");
+      if (!ok) {
+        loadingOverlay.classList.add("hidden");
+        noPermissionOverlay.classList.remove("hidden");
+        return;
+      }
+      await loadProblems(problemsSnapshotPromise);
+      perfMark("問題の到着待ちと整理（Firestore）");
+      setLoadingStage("画像を読み込んでいます｡", 60, 84);
+      await preloadProblemImages();
+      perfMark("画像の読み込み");
+      setLoadingStage("進行状況に接続しています｡", 85, 98);
+      attachSessionListener();
+    } catch (error) {
+      console.error(error);
+      loadingOverlay.classList.add("hidden");
+      LiveDialog.alert("読み込みに失敗しました。\n" + error);
+    }
+  });
+});
+
+function getParmFromUrl(parm) {
+  const params = new URLSearchParams(window.location.search);
+  return params.get(parm);
+}
+function now() {
+  return Date.now() + serverTimeOffset;
+}
+
+async function loadBookAndVerifyHost(bookSnapshotPromise) {
+  const bookDoc = await bookSnapshotPromise;
+  if (!bookDoc.exists()) return false;
+  const data = bookDoc.data();
+  hostTitleText.textContent = data.title || "";
+  return data.madeBy === myUserId;
+}
+
+async function loadProblems(problemsSnapshotPromise) {
+  const snapshot = await problemsSnapshotPromise;
+
+  problemsData = snapshot.docs.map(doc => {
+    const data = doc.data();
+    const answerType = data.answerType || "single";
+    return [
+      data.problem || "",
+      data.choices || [],
+      data.answer || [],
+      data.explanation || "",
+      data.imageUrl || "",
+      answerType,
+      !!data.shuffleChoices,
+      data.modelAnswer || "",
+      data.gradingCriteria || ""
+    ];
+  });
+}
+
+// ★ 問題の画像をあらかじめブラウザにキャッシュさせておく（出題時の表示待ちを防ぐ）
+function preloadProblemImages() {
+  const urls = problemsData.map(problem => problem[4]).filter(Boolean);
+  if (urls.length === 0) return Promise.resolve();
+
+  let loadedCount = 0;
+  const allLoaded = Promise.all(
+    urls.map(
+      url =>
+        new Promise(resolve => {
+          const img = new Image();
+          img.onload = img.onerror = () => { // 画像取得に失敗しても全体の読み込みは止めない
+            loadedCount++;
+            resolve();
+          };
+          img.src = url;
+        })
+    )
+  );
+  // ★ 初回表示で画像の読み込みを待つのは最大3秒まで。超えた分は裏で読み込みを続け、読み込み画面は先に閉じる
+  return Promise.race([
+    allLoaded,
+    new Promise(resolve => setTimeout(() => {
+      if (loadedCount < urls.length) perfNote(`画像の読み込み待ちを3秒で打ち切りました（${loadedCount}/${urls.length}枚が完了。残りは裏で読み込み続行）`);
+      resolve();
+    }, 3000))
+  ]);
+}
+
+function attachSessionListener() {
+  sessionRef = rtdbRef(rtdb, `liveSessions/${bookId}`);
+  onValue(sessionRef, snap => {
+      sessionData = snap.val();
+      if (!loadingFinished) {
+        loadingFinished = true;
+        perfMark("進行状況(Realtime Database)の最初の受信");
+        finishLoading({ isAdmin: false, page: "liveHost.html（みんなで解く・主催者）", myUserId }); // ★ このページはユーザー文書の管理者判定をしないので、計測レポートは出さない
+      }
+      if (!sessionData) {
+        setPhase(phaseSessionMissing);
+        return;
+      }
+      render();
+    },
+    error => {
+      console.error("セッション情報の取得に失敗しました:", error);
+      loadingOverlay.classList.add("hidden");
+      LiveDialog.alert("セッション情報の取得に失敗しました。権限設定をご確認ください。\n" + error.message);
+    });
+}
+
+function setPhase(phase) {
+  [phaseWaiting, phaseCountdown, phaseQuestion, phaseGrading, phaseResults, phaseFinished, phaseSessionMissing].forEach(
+    el => el.classList.add("hidden")
+  );
+  phaseQuestion.classList.remove("question-settled");
+  phaseResults.classList.remove("show", "stacked-below");
+  phase.classList.remove("hidden");
+}
+
+// ★ 参加者側と同じく、正解発表後も問題カードを消さずに少し縮めて下にどかしたまま残し、
+//   その上に結果(得点・ランキング)を表示する
+function showResultsStackedBelowQuestion() {
+  phaseQuestion.classList.remove("hidden");
+  phaseQuestion.classList.add("question-settled");
+  phaseResults.classList.remove("hidden");
+  phaseResults.classList.add("stacked-below");
+  requestAnimationFrame(() => phaseResults.classList.add("show"));
+}
+
+function resetBrokenSessionAndGoHome() {
+  // ★ 募集状態はFirestoreではなくRTDBのliveSessionsのみで管理しているため、
+  //   セッションが無い(壊れている)場合は特に何も消さずホームへ戻ればよい
+  window.location.href = "./app.html";
+}
+
+function render() {
+  const status = sessionData.status;
+  const participants = sessionData.participants || {};
+  const participantIds = Object.keys(participants);
+
+  if (!bgmStarted && status !== "cancelled" && status !== "finished") {
+    bgmStarted = true;
+    LiveAudio.startBgm();
+  }
+
+  const statusChanged = status !== lastRenderedStatus;
+  lastRenderedStatus = status;
+  if (statusChanged && status !== "finished") {
+    finishedRevealStarted = false;
+  }
+
+  const midGameStatuses = ["countdown", "question", "grading", "results"];
+  endLiveEarlyButton.classList.toggle("hidden", !midGameStatuses.includes(status));
+
+  if (status === "waiting") {
+    setPhase(phaseWaiting);
+    if (!isEditingWaitingComment) {
+      const comment = (sessionData.recruitComment || "").trim();
+      waitingCommentText.textContent = comment || "(コメントはありません)";
+    }
+    waitingParticipantsCount.textContent = participantIds.length;
+    if (!userChangedTimeLimit) {
+      selectedTimeLimitSeconds = sessionData.timeLimitSeconds || 0;
+      Array.from(waitingTimeLimitOptions.children).forEach(b => {
+        b.classList.toggle("active", Number(b.dataset.value) === selectedTimeLimitSeconds);
+      });
+    }
+    waitingParticipantsList.innerHTML = "";
+    participantIds.forEach(uid => {
+      const chip = document.createElement("span");
+      chip.classList.add("participant-chip");
+      const nameSpan = document.createElement("span");
+      nameSpan.classList.add("chip-name");
+      nameSpan.textContent = participants[uid].name || uid;
+      applyRainbowNameClass(nameSpan, uid);
+      chip.appendChild(nameSpan);
+      waitingParticipantsList.appendChild(chip);
+    });
+    // ★ 参加者が1人もいない場合はスタートできないようにする
+    startSessionButton.disabled = participantIds.length === 0;
+  } else if (status === "countdown") {
+    // ★ カウントダウンはローカルのタイマーだけで進行させる。RTDBの再通知(ServerValue.TIMESTAMPの
+    //   確定タイミングなど)で何度もここに来ても、初回の切り替わり以外は完全に無視する
+    if (statusChanged) {
+      setPhase(phaseCountdown);
+    }
+  } else if (status === "question") {
+    setPhase(phaseQuestion);
+    if (statusChanged) LiveAudio.playQuestionStart();
+    renderQuestionPhase();
+  } else if (status === "grading") {
+    setPhase(phaseGrading);
+    renderGradingPhase();
+  } else if (status === "results") {
+    if (statusChanged) LiveAudio.playReveal();
+    showResultsStackedBelowQuestion();
+    renderResultsPhase();
+  } else if (status === "finished") {
+    setPhase(phaseFinished);
+    if (statusChanged) {
+      LiveAudio.stopBgm();
+      bgmStarted = false;
+    }
+    renderFinishedPhase(statusChanged);
+  } else if (status === "cancelled") {
+    LiveAudio.stopBgm();
+    window.location.href = "./app.html";
+  }
+}
+
+function renderQuestionPhase() {
+  const index = sessionData.currentQuestionIndex;
+  const problem = problemsData[index];
+  if (!problem) return;
+
+  questionIndexText.textContent = `第 ${index + 1} 問 / ${problemsData.length} 問`;
+  questionText.textContent = problem[0];
+
+  if (problem[4]) {
+    questionImage.src = problem[4];
+    questionImage.classList.remove("hidden");
+  } else {
+    questionImage.classList.add("hidden");
+  }
+
+  const answerType = problem[5];
+
+  const answers = (sessionData.answers && sessionData.answers[index]) || {};
+  const participants = sessionData.participants || {};
+  const answeredCount = Object.keys(answers).length;
+  const totalCount = Object.keys(participants).length;
+  questionAnsweredCount.textContent = `解答済み: ${answeredCount} / ${totalCount} 人`;
+
+  renderAnswerStatusArea(index, problem, answers, participants, totalCount);
+
+  const locked = !!sessionData.locked;
+  cutoffButton.disabled = locked;
+  cutoffButton.textContent = locked ? "締め切り済み" : "この問題の受付を締め切る";
+  // ★ 全員解答済みになったら締め切るボタンを強調表示する
+  const allAnswered = !locked && totalCount > 0 && answeredCount >= totalCount;
+  cutoffButton.classList.toggle("cutoff-emphasis", allAnswered);
+
+  updateQuestionTimerDisplay();
+}
+
+// ★ 解答者名の一覧をモーダルで表示する(選択肢/単語行のクリック時に使用)
+function showAnswerStatusNamesModal(label, names) {
+  answerStatusNamesTitle.textContent = label;
+  answerStatusNamesArea.innerHTML = "";
+
+  if (names.length === 0) {
+    const empty = document.createElement("p");
+    empty.classList.add("answer-status-names-empty");
+    empty.textContent = "まだ誰もいません";
+    answerStatusNamesArea.appendChild(empty);
+  } else {
+    names.forEach(name => {
+      const chip = document.createElement("span");
+      chip.classList.add("participant-chip");
+      chip.textContent = name;
+      answerStatusNamesArea.appendChild(chip);
+    });
+  }
+
+  answerStatusNamesModal.classList.remove("hidden");
+}
+
+// ★ 主催者向け: 全員が何を答えたか見える解答状況パネル
+// showAnswerStatusEnabled: 参加人数の内訳(ゲージ・人数・クリックで解答者名)を見せるか
+// showCorrectAnswerEnabled: 正解の強調表示(緑枠・「✓ 正解」・模範解答)を見せるか
+function renderAnswerStatusArea(index, problem, answers, participants, totalCount) {
+  const answerType = problem[5];
+
+  const showStatus = showAnswerStatusEnabled;
+  const showCorrect = showCorrectAnswerEnabled;
+
+  // ★ どちらもオフなら、表示すべき情報が無いのでセクションごと隠す
+  const nothingToShow = !showStatus && !showCorrect;
+  answerStatusHeading.classList.toggle("hidden", nothingToShow);
+  answerStatusArea.classList.toggle("hidden", nothingToShow);
+  if (nothingToShow) {
+    answerStatusArea.innerHTML = "";
+    answerStatusArea.dataset.renderKey = "";
+    return;
+  }
+
+  // ★ 同じ問題・同じ表示設定のままの再描画(参加者の解答が増えただけ)かどうかを判定。
+  //   選択式はこの場合だけDOMを作り直さずゲージ幅/人数を更新し、CSSのtransitionで滑らかに変化させる。
+  //   問題が変わった/表示設定が変わったときは、これまで通り作り直す。
+  const renderKey = `${index}|${answerType}|${showStatus}|${showCorrect}`;
+  const isChoiceType = answerType === "single" || answerType === "multiple";
+  const sameContext =
+    isChoiceType &&
+    answerStatusArea.dataset.renderKey === renderKey &&
+    answerStatusArea.children.length === problem[1].length;
+  answerStatusArea.dataset.renderKey = renderKey;
+
+  if (isChoiceType) {
+    const choices = problem[1];
+    const correctIndices = problem[2];
+
+    if (!sameContext) answerStatusArea.innerHTML = "";
+
+    choices.forEach((choiceText, i) => {
+      const names = [];
+      Object.entries(answers).forEach(([uid, ans]) => {
+        const raw = Array.isArray(ans.raw) ? ans.raw : [];
+        if (raw.includes(i)) names.push((participants[uid] && participants[uid].name) || uid);
+      });
+      const count = names.length;
+      const percent = totalCount > 0 ? Math.round((count / totalCount) * 100) : 0;
+      const isCorrect = showCorrect && correctIndices.includes(i);
+
+      let row = sameContext ? answerStatusArea.children[i] : null;
+      if (!row) {
+        row = document.createElement("button");
+        row.type = "button";
+        row.classList.add("answer-status-choice");
+        if (!showStatus) row.classList.add("answer-status-choice-plain");
+        if (isCorrect) row.classList.add("correct");
+
+        let html = "";
+        if (showStatus) html += `<span class="answer-status-fill" style="width:${percent}%"></span>`;
+        html += `<span class="answer-status-label">${escapeHtml(choiceText)}${
+          isCorrect ? ' <span class="answer-status-correct-mark">✓ 正解</span>' : ""
+        }</span>`;
+        if (showStatus) html += `<span class="answer-status-count">${count}人 (${percent}%)</span>`;
+        row.innerHTML = html;
+
+        row.disabled = !showStatus;
+        answerStatusArea.appendChild(row);
+      } else {
+        // ★ 既存の行はゲージ幅と人数だけ書き換える(要素は作り直さない)
+        const fillEl = row.querySelector(".answer-status-fill");
+        if (fillEl) fillEl.style.width = `${percent}%`;
+        const countEl = row.querySelector(".answer-status-count");
+        if (countEl) countEl.textContent = `${count}人 (${percent}%)`;
+      }
+
+      // ★ クリックで常に最新の解答者名を見せられるよう、ハンドラは毎回張り替える
+      row.onclick = showStatus ? () => showAnswerStatusNamesModal(choiceText, names) : null;
+    });
+  } else if (answerType === "text") {
+    answerStatusArea.innerHTML = "";
+
+    // ★ 被りがないように単語ごとにまとめつつ、正解の単語は正答者がいなくても常にトップに表示する
+    //   (ただし正解を見せない設定のときは、未回答の正解ワードを補うと答えが漏れてしまうため補わない)
+    const correctWords = problem[2] || [];
+    const wordMap = new Map(); // word -> [names]
+    Object.entries(answers).forEach(([uid, ans]) => {
+      const word = (ans.raw || "").trim();
+      if (!word) return;
+      const name = (participants[uid] && participants[uid].name) || uid;
+      if (!wordMap.has(word)) wordMap.set(word, []);
+      wordMap.get(word).push(name);
+    });
+
+    const orderedWords = [];
+    if (showCorrect) {
+      correctWords.forEach(w => {
+        if (!orderedWords.includes(w)) orderedWords.push(w);
+        if (!wordMap.has(w)) wordMap.set(w, []);
+      });
+    }
+    if (showStatus) {
+      wordMap.forEach((_, w) => {
+        if (!orderedWords.includes(w)) orderedWords.push(w);
+      });
+    }
+
+    if (orderedWords.length === 0 && showStatus) {
+      const empty = document.createElement("p");
+      empty.classList.add("answer-status-empty");
+      empty.textContent = "まだ解答がありません";
+      answerStatusArea.appendChild(empty);
+    }
+
+    orderedWords.forEach(word => {
+      const names = showStatus ? (wordMap.get(word) || []) : [];
+      const isCorrect = showCorrect && correctWords.includes(word);
+
+      const row = document.createElement("button");
+      row.type = "button";
+      row.classList.add("answer-status-word-row");
+      if (!showStatus) row.classList.add("answer-status-choice-plain");
+      if (isCorrect) row.classList.add("correct");
+      let html = `<span class="answer-status-label">${escapeHtml(word)}${
+        isCorrect ? ' <span class="answer-status-correct-mark">✓ 正解</span>' : ""
+      }</span>`;
+      if (showStatus) html += `<span class="answer-status-count">${names.length}人</span>`;
+      row.innerHTML = html;
+
+      row.disabled = !showStatus;
+      row.onclick = showStatus ? () => showAnswerStatusNamesModal(word, names) : null;
+      answerStatusArea.appendChild(row);
+    });
+  } else if (answerType === "descriptive") {
+    answerStatusArea.innerHTML = "";
+
+    // ★ 模範解答は正解表示がオンのときだけ、参加者の解答一覧は解答状況表示がオンのときだけ出す
+    if (showCorrect) {
+      const modelRow = document.createElement("div");
+      modelRow.classList.add("answer-status-descriptive-row", "correct");
+      modelRow.innerHTML =
+        `<span class="answer-status-descriptive-name">✓ 模範解答</span>` +
+        `<span class="answer-status-descriptive-text">${escapeHtml(problem[7] || "")}</span>`;
+      answerStatusArea.appendChild(modelRow);
+    }
+
+    if (showStatus) {
+      const rows = Object.entries(answers).map(([uid, ans]) => ({
+        name: (participants[uid] && participants[uid].name) || uid,
+        text: ans.raw || ""
+      }));
+
+      if (rows.length === 0) {
+        const empty = document.createElement("p");
+        empty.classList.add("answer-status-empty");
+        empty.textContent = "まだ解答がありません";
+        answerStatusArea.appendChild(empty);
+      } else {
+        rows.forEach(r => {
+          const row = document.createElement("div");
+          row.classList.add("answer-status-descriptive-row");
+          row.innerHTML =
+            `<span class="answer-status-descriptive-name">${escapeHtml(r.name)}</span>` +
+            `<span class="answer-status-descriptive-text">${escapeHtml(r.text)}</span>`;
+          answerStatusArea.appendChild(row);
+        });
+      }
+    }
+  }
+}
+
+function updateQuestionTimerDisplay() {
+  const timeLimit = sessionData.timeLimitSeconds || 0;
+  if (timeLimit <= 0) {
+    questionTimerText.textContent = "無制限";
+    questionTimerBar.style.width = "100%";
+    return;
+  }
+  const startedAt = sessionData.questionStartedAt || now();
+  const elapsedSec = (now() - startedAt) / 1000;
+  const remainingSec = Math.max(0, Math.ceil(timeLimit - elapsedSec));
+  questionTimerText.textContent = `残り ${remainingSec} 秒`;
+  const ratio = Math.max(0, Math.min(1, (timeLimit - elapsedSec) / timeLimit));
+  questionTimerBar.style.width = `${ratio * 100}%`;
+  questionTimerBar.classList.toggle("timer-warning", ratio < 0.3);
+}
+
+function renderGradingPhase() {
+  const index = sessionData.currentQuestionIndex;
+  const problem = problemsData[index];
+  gradingErrorText.classList.add("hidden");
+  requestAiGradingButton.disabled = false;
+  requestAiGradingButton.textContent = "AIに一括採点を依頼";
+
+  const answers = (sessionData.answers && sessionData.answers[index]) || {};
+  const participants = sessionData.participants || {};
+  const entries = Object.entries(answers);
+
+  gradingHintText.textContent = `${entries.length} 件の記述解答があります。まとめてAIに採点を依頼できます。`;
+  gradingSubmissionsArea.innerHTML = "";
+  entries.forEach(([uid, ans]) => {
+    const row = document.createElement("div");
+    row.classList.add("grading-submission-row");
+    const name = (participants[uid] && participants[uid].name) || uid;
+    row.innerHTML = `<span class="grading-submission-name">${escapeHtml(name)}</span><span class="grading-submission-text">${escapeHtml(
+      ans.raw || ""
+    )}</span>`;
+    gradingSubmissionsArea.appendChild(row);
+  });
+
+  // ★ AIの採点が長時間終わらない時のために、手動採点ボタンも用意しておく(解答が無ければ出す意味が無い)
+  manualGradingButton.classList.toggle("hidden", entries.length === 0);
+
+  // ★ 問題が変わったら、前の問題用に保留していたAI結果は無効化する
+  if (pendingAiGradingResultIndex !== index) {
+    pendingAiGradingResult = null;
+    pendingAiGradingResultIndex = -1;
+  }
+}
+
+// ---- 手動採点(AIの採点が長すぎて進まない時の代替手段) ----
+
+function openManualGradingModal() {
+  const index = sessionData.currentQuestionIndex;
+  const answers = (sessionData.answers && sessionData.answers[index]) || {};
+  manualGradingEntries = Object.entries(answers);
+  if (manualGradingEntries.length === 0) return;
+
+  manualGradingScores = {};
+  manualGradingEntries.forEach(([uid]) => {
+    manualGradingScores[uid] = 5; // ★ 初期値は10点満点中5点にしておく(未採点のまま送信されるのを避けるため)
+  });
+  manualGradingCurrentIndex = 0;
+
+  const problem = problemsData[index];
+  manualGradingCriteriaText.textContent = problem[8] || "(採点基準は設定されていません)";
+  manualGradingModelAnswerText.textContent = problem[7] || "(模範解答は設定されていません)";
+
+  renderManualGradingStep();
+  // ★ モーダルを開く前に既にAIの採点が終わっていた場合(一度モーダルを閉じて開き直した場合など)は
+  //   最初からバナーを出しておく
+  if (pendingAiGradingResult && pendingAiGradingResultIndex === index) {
+    showManualGradingAiReadyBanner();
+  } else {
+    hideManualGradingAiReadyBanner();
+  }
+  manualGradingModal.classList.remove("hidden");
+}
+
+function closeManualGradingModal() {
+  manualGradingModal.classList.add("hidden");
+}
+
+function showManualGradingAiReadyBanner() {
+  manualGradingAiReadyBanner.classList.remove("hidden");
+}
+function hideManualGradingAiReadyBanner() {
+  manualGradingAiReadyBanner.classList.add("hidden");
+}
+
+function renderManualGradingStep() {
+  const [uid, ans] = manualGradingEntries[manualGradingCurrentIndex];
+  const participants = sessionData.participants || {};
+  const name = (participants[uid] && participants[uid].name) || uid;
+  const total = manualGradingEntries.length;
+  const current = manualGradingCurrentIndex + 1;
+
+  manualGradingProgressText.textContent = `${current} / ${total} 人目`;
+  manualGradingSubmissionName.textContent = name;
+  manualGradingSubmissionText.textContent = ans.raw || "(解答がありません)";
+
+  const score = manualGradingScores[uid] !== undefined ? manualGradingScores[uid] : 5;
+  manualGradingScoreSlider.value = score;
+  manualGradingScoreValue.textContent = score;
+
+  manualGradingPrevButton.disabled = manualGradingCurrentIndex === 0;
+  manualGradingNextButton.textContent = current === total ? "採点を確定する" : "次へ";
+}
+
+// ★ direction: -1で前へ、+1で次へ(最後の人の時は確定処理に入る)
+async function stepManualGrading(direction) {
+  const [uid] = manualGradingEntries[manualGradingCurrentIndex];
+  manualGradingScores[uid] = Number(manualGradingScoreSlider.value);
+
+  const isLast = manualGradingCurrentIndex === manualGradingEntries.length - 1;
+  if (direction > 0 && isLast) {
+    await finalizeManualGrading();
+    return;
+  }
+
+  manualGradingCurrentIndex = Math.max(0, Math.min(manualGradingEntries.length - 1, manualGradingCurrentIndex + direction));
+  renderManualGradingStep();
+}
+
+async function finalizeManualGrading() {
+  manualGradingNextButton.disabled = true;
+  manualGradingPrevButton.disabled = true;
+  try {
+    const index = sessionData.currentQuestionIndex;
+    const problem = problemsData[index];
+    const scoreMap = {};
+    manualGradingEntries.forEach(([uid]) => {
+      scoreMap[uid] = { score: manualGradingScores[uid], reason: "主催者による手動採点" };
+    });
+    await finalizeDescriptiveGrading(index, problem, scoreMap);
+    // ★ 手動採点を確定したので、同じ問題に対して裏で終わっていたかもしれないAI結果はもう不要
+    pendingAiGradingResult = null;
+    pendingAiGradingResultIndex = -1;
+    closeManualGradingModal();
+  } catch (error) {
+    console.error(error);
+    await LiveDialog.alert("手動採点の確定に失敗しました。\n" + (error.message || error));
+  } finally {
+    manualGradingNextButton.disabled = false;
+    manualGradingPrevButton.disabled = false;
+  }
+}
+
+// ★ 手動採点中にAIの採点が裏で終わった場合、バナーの「AI採点結果を返却」ボタンから呼ばれる。
+//   手動採点は中止し、AIの結果をそのまま採用して確定する
+async function useAiGradingResult() {
+  if (!pendingAiGradingResult) return;
+  const index = sessionData.currentQuestionIndex;
+  const problem = problemsData[index];
+
+  manualGradingUseAiResultButton.disabled = true;
+  try {
+    await finalizeDescriptiveGrading(index, problem, pendingAiGradingResult);
+    pendingAiGradingResult = null;
+    pendingAiGradingResultIndex = -1;
+    closeManualGradingModal();
+  } catch (error) {
+    console.error(error);
+    await LiveDialog.alert("AI採点結果の返却に失敗しました。\n" + (error.message || error));
+  } finally {
+    manualGradingUseAiResultButton.disabled = false;
+  }
+}
+
+// ★ 前回の問題までの累計点数を基準にした、今回加算する前の順位
+function buildRankingBeforeThisRound() {
+  const participants = sessionData.participants || {};
+  const deltaMap = buildScoreDeltaMap();
+  return Object.keys(participants)
+    .map(uid => ({
+      uid,
+      name: (participants[uid] && participants[uid].name) || uid,
+      score: deltaMap[uid] ? deltaMap[uid].before : 0
+    }))
+    .filter(entry => entry.score > 0) // ★ 0点の人はランキングから除外する
+    .sort((a, b) => b.score - a.score);
+}
+
+// ★ uid -> { before(今回加算前の累計), after(現在の累計), delta(今回の得点) }
+function buildScoreDeltaMap() {
+  const index = sessionData.currentQuestionIndex;
+  const totalScores = sessionData.totalScores || {};
+  const participants = sessionData.participants || {};
+  const roundAnswers = (sessionData.answers && sessionData.answers[index]) || {};
+  const map = {};
+  Object.keys(participants).forEach(uid => {
+    const thisRoundScore =
+      roundAnswers[uid] && typeof roundAnswers[uid].score === "number" ? roundAnswers[uid].score : 0;
+    const after = totalScores[uid] || 0;
+    const before = Math.max(0, after - thisRoundScore);
+    map[uid] = { before, after, delta: after - before };
+  });
+  return map;
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ★ 数値表示を、指定時間かけて滑らかにカウントアップさせる
+function animateCountUp(el, from, to, duration) {
+  if (from === to) {
+    el.textContent = to;
+    return Promise.resolve();
+  }
+  return new Promise(resolve => {
+    const startTime = performance.now();
+    function step(now) {
+      const progress = Math.min(1, (now - startTime) / duration);
+      const eased = 1 - Math.pow(1 - progress, 3); // ease-out
+      el.textContent = Math.round(from + (to - from) * eased);
+      if (progress < 1) {
+        requestAnimationFrame(step);
+      } else {
+        el.textContent = to;
+        resolve();
+      }
+    }
+    requestAnimationFrame(step);
+  });
+}
+
+// ★ 今回の結果発表を「①加算前の順位を表示→②得点がカウントアップ→③順位が入れ替わる」の3段階で見せる。
+//   同じ問題の間に何度もrenderResultsPhase()が呼ばれても、このシーケンスは初回の1回だけ再生する
+let resultsSequencePlayedIndex = -1;
+
+async function playResultsLeaderboardSequence(container, isFinal) {
+  const beforeRanking = buildRankingBeforeThisRound();
+  const deltaMap = buildScoreDeltaMap();
+
+  // ★①まずは、今回の得点を加算する前の順位をそのまま表示する
+  container.innerHTML = "";
+  beforeRanking.forEach((entry, i) => {
+    const row = buildLeaderboardRow(entry, i + 1);
+    container.appendChild(row);
+  });
+
+  await wait(700);
+
+  // ★②各自の得点を、加算前の点数から加算後の点数までカウントアップさせる
+  const countPromises = Array.from(container.children).map(row => {
+    const info = deltaMap[row.dataset.uid];
+    if (!info || info.delta === 0) return Promise.resolve();
+    const scoreEl = row.querySelector(".leaderboard-score");
+    if (!scoreEl) return Promise.resolve();
+    return animateCountUp(scoreEl, info.before, info.after, 700);
+  });
+  await Promise.all(countPromises);
+
+  await wait(350);
+
+  // ★③加算後の順位へ、既存のFLIPアニメーションで入れ替える
+  renderLeaderboard(container, isFinal);
+}
+
+function renderResultsPhase() {
+  const index = sessionData.currentQuestionIndex;
+  const answerKey = sessionData.currentAnswerKey || {};
+  resultsCorrectArea.innerHTML = "";
+
+  const label = document.createElement("p");
+  label.classList.add("results-answer-label");
+  label.textContent = "正解";
+  resultsCorrectArea.appendChild(label);
+  const value = document.createElement("p");
+  value.classList.add("results-answer-value");
+  value.textContent = answerKey.answerText || "";
+  resultsCorrectArea.appendChild(value);
+  if (answerKey.explanation) {
+    const exp = document.createElement("p");
+    exp.classList.add("results-explanation");
+    exp.textContent = answerKey.explanation;
+    resultsCorrectArea.appendChild(exp);
+  }
+
+  if (resultsSequencePlayedIndex !== index) {
+    resultsSequencePlayedIndex = index;
+    playResultsLeaderboardSequence(resultsLeaderboardArea);
+  } else {
+    renderLeaderboard(resultsLeaderboardArea);
+  }
+
+  const isLast = index >= problemsData.length - 1;
+  nextQuestionButton.textContent = isLast ? "結果発表を見る" : "次の問題へ";
+}
+
+function buildRanking() {
+  const totalScores = sessionData.totalScores || {};
+  const participants = sessionData.participants || {};
+  return Object.keys(participants)
+    .map(uid => ({ uid, name: (participants[uid] && participants[uid].name) || uid, score: totalScores[uid] || 0 }))
+    .filter(entry => entry.score > 0) // ★ 0点の人はランキングから除外する
+    .sort((a, b) => b.score - a.score);
+}
+
+function buildLeaderboardRow(entry, rank) {
+  const row = document.createElement("div");
+  row.classList.add("leaderboard-row");
+  row.dataset.uid = entry.uid;
+  row.innerHTML = `<span class="leaderboard-rank">${rank}</span><span class="leaderboard-name">${escapeHtml(
+    entry.name
+  )}</span><span class="leaderboard-score">${entry.score}</span>`;
+  applyRainbowNameClass(row.querySelector(".leaderboard-name"), entry.uid);
+  return row;
+}
+
+// ★ ①ランキングが変動したら、順位の入れ替わりを滑らかにアニメーションさせる(FLIPテクニック)
+function renderLeaderboard(container, isFinal) {
+  const ranking = buildRanking();
+
+  const firstRects = {};
+  Array.from(container.children).forEach(row => {
+    if (row.dataset.uid) firstRects[row.dataset.uid] = row.getBoundingClientRect();
+  });
+
+  container.innerHTML = "";
+  ranking.forEach((entry, i) => {
+    const rank = i + 1;
+    const row = buildLeaderboardRow(entry, rank);
+    if (isFinal && rank <= 3) row.classList.add(`rank-${rank}`);
+    container.appendChild(row);
+  });
+
+  Array.from(container.children).forEach(row => {
+    const first = firstRects[row.dataset.uid];
+    if (!first) {
+      row.classList.add("row-pop-in");
+      return;
+    }
+    const last = row.getBoundingClientRect();
+    const deltaY = first.top - last.top;
+    if (Math.abs(deltaY) > 1) {
+      row.style.transition = "none";
+      row.style.transform = `translateY(${deltaY}px)`;
+      requestAnimationFrame(() => {
+        row.style.transition = "transform 0.5s cubic-bezier(0.22, 1, 0.36, 1)";
+        row.style.transform = "";
+      });
+    }
+  });
+}
+
+// ★ ②最終結果は3位→2位→(ため)→1位の順に一つずつ演出しながら発表する。4位以下は即表示
+let finishedRevealStarted = false;
+
+function renderFinishedPhase(isFreshTransition) {
+  if (finishedRevealStarted) return;
+  finishedRevealStarted = true;
+
+  const ranking = buildRanking();
+  finishedLeaderboardArea.innerHTML = "";
+  finishedButtonsArea.classList.remove("show");
+  finishedButtonsArea.classList.add("hidden");
+
+  // ★ ②表彰台(1〜3位)は最初から場所を確保しておき、中身は隠した状態で挿入する(あとで見た目だけ切り替える)
+  // 参加人数が3人未満でも枠は常に3つ表示する(空きは名前を「-」にしたプレースホルダー)
+  const top3 = [0, 1, 2].map(i => ranking[i] || { uid: `placeholder-rank-${i + 1}`, name: "-", score: "-" });
+  const podiumRows = top3.map((entry, i) => {
+    const row = buildLeaderboardRow(entry, i + 1);
+    row.classList.add(`rank-${i + 1}`, "podium-reveal");
+    finishedLeaderboardArea.appendChild(row);
+    return row;
+  });
+
+  const rest = ranking.slice(3);
+  const restFragment = document.createDocumentFragment();
+  rest.forEach((entry, i) => restFragment.appendChild(buildLeaderboardRow(entry, i + 4)));
+  finishedLeaderboardArea.appendChild(restFragment);
+
+  if (isFreshTransition) {
+    revealPodium(podiumRows);
+  } else {
+    podiumRows.forEach(row => row.classList.add("podium-reveal-active"));
+    showFinishedButtons();
+  }
+}
+
+function revealPodium(podiumRows) {
+  // podiumRows[0]=1位, [1]=2位, [2]=3位 (既にDOM上には配置済み。表示だけ後から切り替える)
+  const revealSeq = [2, 1, 0]; // 3位→2位→1位の順
+  const delays = [500, 1300, 2900];
+  revealSeq.forEach((idx, seq) => {
+    const row = podiumRows[idx];
+    if (!row) return;
+    setTimeout(() => {
+      row.classList.add("podium-reveal-active");
+      if (idx === 0) {
+        row.classList.add("podium-first-flourish");
+        LiveAudio.playFanfare();
+        setTimeout(showFinishedButtons, 900);
+      } else {
+        LiveAudio.playReveal();
+      }
+    }, delays[seq]);
+  });
+}
+
+function showFinishedButtons() {
+  finishedButtonsArea.classList.remove("hidden");
+  requestAnimationFrame(() => finishedButtonsArea.classList.add("show"));
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// ================= セッション進行 =================
+
+async function startSession() {
+  const participantCount = Object.keys((sessionData && sessionData.participants) || {}).length;
+  if (participantCount === 0) return;
+  startSessionButton.disabled = true;
+  try {
+    const timeLimitSeconds = selectedTimeLimitSeconds;
+    await rtdbUpdate(sessionRef, {
+      status: "countdown",
+      timeLimitSeconds,
+      currentQuestionIndex: 0,
+      countdownStartedAt: rtdbServerTimestamp()
+    });
+    runLocalCountdown(() => beginQuestion(0));
+  } catch (error) {
+    console.error(error);
+    LiveDialog.alert("開始に失敗しました。");
+    startSessionButton.disabled = false;
+  }
+}
+
+function runLocalCountdown(onDone) {
+  let count = 3;
+  showCountdownNumber(count);
+  clearInterval(countdownIntervalHandle);
+  countdownIntervalHandle = setInterval(() => {
+    count -= 1;
+    if (count <= 0) {
+      clearInterval(countdownIntervalHandle);
+      onDone();
+    } else {
+      showCountdownNumber(count);
+    }
+  }, 1000);
+}
+
+// ★ クラスを一度外して付け直すことで、切り替わるたびにポップイン(最大サイズ)から演出をやり直す
+function showCountdownNumber(count) {
+  countdownNumberEl.textContent = count;
+  countdownNumberEl.classList.remove("pop");
+  void countdownNumberEl.offsetWidth;
+  countdownNumberEl.classList.add("pop");
+  LiveAudio.playCountdownTick(count === 1);
+}
+
+async function beginQuestion(index) {
+  const problem = problemsData[index];
+  if (!problem) return;
+
+  const currentQuestion = {
+    index,
+    problem: problem[0],
+    imageUrl: problem[4] || "",
+    answerType: problem[5],
+    choices: problem[5] === "single" || problem[5] === "multiple" ? problem[1] : null,
+    shuffleChoices: problem[6]
+  };
+
+  await rtdbUpdate(sessionRef, {
+    status: "question",
+    currentQuestionIndex: index,
+    currentQuestion,
+    currentAnswerKey: null,
+    questionStartedAt: rtdbServerTimestamp(),
+    locked: false
+  });
+
+  clearTimeout(questionTimeoutHandle);
+  const timeLimit = sessionData.timeLimitSeconds || 0;
+  if (timeLimit > 0) {
+    questionTimeoutHandle = setTimeout(() => lockQuestion(), timeLimit * 1000 + 400);
+  }
+
+  startTimerRefreshLoop();
+}
+
+let timerRefreshHandle = null;
+function startTimerRefreshLoop() {
+  clearInterval(timerRefreshHandle);
+  timerRefreshHandle = setInterval(() => {
+    if (sessionData && sessionData.status === "question") {
+      updateQuestionTimerDisplay();
+    } else {
+      clearInterval(timerRefreshHandle);
+    }
+  }, 250);
+}
+
+async function lockQuestion() {
+  if (!sessionData || sessionData.status !== "question" || sessionData.locked) return;
+  clearTimeout(questionTimeoutHandle);
+  LiveAudio.playLock();
+  await rtdbUpdate(sessionRef, { locked: true });
+
+  const index = sessionData.currentQuestionIndex;
+  const answerType = problemsData[index][5];
+  if (answerType === "descriptive") {
+    await rtdbUpdate(sessionRef, { status: "grading" });
+  } else {
+    await autoGradeAndShowResults(index);
+  }
+}
+
+// ★ correctFraction(0〜1)と回答時刻から、スピードボーナス込みのスコアを算出する
+function computeScore(correctFraction, submittedAt, questionStartedAt, timeLimitSeconds) {
+  if (correctFraction <= 0) return 0;
+  if (!timeLimitSeconds) return Math.round(BASE_SCORE * correctFraction);
+  const elapsedSec = Math.max(0, (submittedAt - questionStartedAt) / 1000);
+  const remainingFrac = Math.max(0, Math.min(1, 1 - elapsedSec / timeLimitSeconds));
+  return Math.round(BASE_SCORE * correctFraction * (0.5 + 0.5 * remainingFrac));
+}
+
+async function autoGradeAndShowResults(index) {
+  const problem = problemsData[index];
+  const answerType = problem[5];
+  const timeLimitSeconds = sessionData.timeLimitSeconds || 0;
+  const questionStartedAt = sessionData.questionStartedAt || 0;
+
+  const answersSnap = await rtdbGet(rtdbRef(rtdb, `liveSessions/${bookId}/answers/${index}`));
+  const answers = answersSnap.exists() ? answersSnap.val() : {};
+
+  const totalScoresSnap = await rtdbGet(rtdbRef(rtdb, `liveSessions/${bookId}/totalScores`));
+  const totalScores = totalScoresSnap.exists() ? totalScoresSnap.val() : {};
+
+  const updates = {};
+  let answerText = "";
+  if (answerType === "text") {
+    answerText = problem[2].join(" / ");
+  } else {
+    answerText = problem[1].filter((_, i) => problem[2].includes(i)).join(" / ");
+  }
+
+  Object.entries(answers).forEach(([uid, ans]) => {
+    let correctFraction = 0;
+    if (answerType === "text") {
+      correctFraction = problem[2].includes((ans.raw || "").trim()) ? 1 : 0;
+    } else {
+      const selected = Array.isArray(ans.raw) ? ans.raw : [];
+      const correctIndices = problem[2];
+      correctFraction = isSameIndexSet(selected, correctIndices) ? 1 : 0;
+    }
+    const score = computeScore(correctFraction, ans.submittedAt || 0, questionStartedAt, timeLimitSeconds);
+    updates[`answers/${index}/${uid}/correct`] = correctFraction >= 1;
+    updates[`answers/${index}/${uid}/score`] = score;
+    updates[`answers/${index}/${uid}/graded`] = true;
+    totalScores[uid] = (totalScores[uid] || 0) + score;
+  });
+
+  updates["totalScores"] = totalScores;
+  updates["currentAnswerKey"] = { answerText, explanation: problem[3] || "" };
+  updates["status"] = "results";
+
+  await rtdbUpdate(rtdbRef(rtdb, `liveSessions/${bookId}`), updates);
+}
+
+function isSameIndexSet(a, b) {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort((x, y) => x - y);
+  const sortedB = [...b].sort((x, y) => x - y);
+  return sortedA.every((value, i) => value === sortedB[i]);
+}
+
+async function requestAiGrading() {
+  requestAiGradingButton.disabled = true;
+  requestAiGradingButton.textContent = "採点中...";
+  gradingErrorText.classList.add("hidden");
+
+  const index = sessionData.currentQuestionIndex;
+  const problem = problemsData[index];
+
+  try {
+    const answersSnap = await rtdbGet(rtdbRef(rtdb, `liveSessions/${bookId}/answers/${index}`));
+    const answers = answersSnap.exists() ? answersSnap.val() : {};
+    const entries = Object.entries(answers);
+
+    let scoreMap = {};
+    if (entries.length > 0) {
+      const results = await gradeDescriptiveBatch({
+        problem: problem[0],
+        modelAnswer: problem[7],
+        gradingCriteria: problem[8],
+        imageUrl: problem[4],
+        submissions: entries.map(([uid, ans]) => ({ userId: uid, text: ans.raw || "" }))
+      });
+      results.forEach(r => {
+        scoreMap[r.userId] = { score: r.score, reason: r.reason };
+      });
+    }
+
+    // ★ 手動採点中(モーダルを開いている間)にAIの結果が返ってきた場合は、
+    //   勝手に確定して画面(採点中→結果発表)を切り替えてしまわないよう、一旦保留してバナーで知らせる。
+    //   手動採点の進行自体は止めない(裏でAI採点を続けさせたいという要望のため)
+    const manualModalOpen = manualGradingModal && !manualGradingModal.classList.contains("hidden");
+    if (manualModalOpen) {
+      pendingAiGradingResult = scoreMap;
+      pendingAiGradingResultIndex = index;
+      showManualGradingAiReadyBanner();
+      requestAiGradingButton.disabled = false;
+      requestAiGradingButton.textContent = "AIに一括採点を依頼";
+      return;
+    }
+
+    await finalizeDescriptiveGrading(index, problem, scoreMap);
+  } catch (error) {
+    console.error(error);
+    gradingErrorText.textContent = "採点でエラーが発生しました。もう一度試してください。\n" + (error.message || error);
+    gradingErrorText.classList.remove("hidden");
+    requestAiGradingButton.disabled = false;
+    requestAiGradingButton.textContent = "AIに一括採点を依頼";
+  }
+}
+
+async function finalizeDescriptiveGrading(index, problem, scoreMap) {
+  const timeLimitSeconds = sessionData.timeLimitSeconds || 0;
+  const questionStartedAt = sessionData.questionStartedAt || 0;
+
+  const answersSnap = await rtdbGet(rtdbRef(rtdb, `liveSessions/${bookId}/answers/${index}`));
+  const answers = answersSnap.exists() ? answersSnap.val() : {};
+
+  const totalScoresSnap = await rtdbGet(rtdbRef(rtdb, `liveSessions/${bookId}/totalScores`));
+  const totalScores = totalScoresSnap.exists() ? totalScoresSnap.val() : {};
+
+  const updates = {};
+  Object.entries(answers).forEach(([uid, ans]) => {
+    const aiResult = scoreMap[uid] || { score: 0, reason: "" };
+    const correctFraction = Math.max(0, Math.min(10, aiResult.score)) / 10;
+    const score = computeScore(correctFraction, ans.submittedAt || 0, questionStartedAt, timeLimitSeconds);
+    updates[`answers/${index}/${uid}/correct`] = correctFraction >= 0.6;
+    updates[`answers/${index}/${uid}/score`] = score;
+    updates[`answers/${index}/${uid}/graded`] = true;
+    updates[`answers/${index}/${uid}/aiScore`] = aiResult.score;
+    updates[`answers/${index}/${uid}/aiReason`] = aiResult.reason;
+    totalScores[uid] = (totalScores[uid] || 0) + score;
+  });
+
+  updates["totalScores"] = totalScores;
+  updates["currentAnswerKey"] = { answerText: problem[7], explanation: problem[3] || "" };
+  updates["status"] = "results";
+
+  await rtdbUpdate(rtdbRef(rtdb, `liveSessions/${bookId}`), updates);
+}
+
+async function getGeminiApiKey() {
+  if (geminiApiKeyCache) return geminiApiKeyCache;
+  const keyDoc = await hedged(() => getDoc(doc(db, "system_keys", "gemini")));
+  const apiKey = keyDoc.exists() ? keyDoc.data().apiKey : null;
+  if (!apiKey) throw new Error("Gemini APIキーが設定されていません。（system_keys/gemini の apiKey）");
+  geminiApiKeyCache = apiKey;
+  return geminiApiKeyCache;
+}
+
+async function fetchImageAsBase64(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`問題画像の取得に失敗しました: ${response.status}`);
+  const blob = await response.blob();
+  const mimeType = blob.type || "image/jpeg";
+  const base64 = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.onerror = () => reject(reader.error || new Error("画像の読み込みに失敗しました"));
+    reader.readAsDataURL(blob);
+  });
+  return { mimeType, base64 };
+}
+
+// ★ 記述式の解答をまとめて1回のGeminiリクエストで採点する（主催者が「一括採点」を押したときに実行）
+async function gradeDescriptiveBatch({ problem, modelAnswer, gradingCriteria, imageUrl, submissions }) {
+  const apiKey = await getGeminiApiKey();
+
+  const promptLines = [
+    "あなたは採点者です。以下の問題・模範解答・採点基準をもとに、複数の生徒の解答をそれぞれ10点満点で採点してください。",
+    "",
+    `【問題文】\n${problem}`,
+    "",
+    `【模範解答】\n${modelAnswer}`
+  ];
+  if (gradingCriteria) promptLines.push("", `【採点基準】\n${gradingCriteria}`);
+  if (imageUrl) promptLines.push("", "※ 問題にはこのあとに続く画像が添付されています。採点の際は画像の内容も踏まえてください。");
+
+  promptLines.push("", "【生徒ごとの解答】");
+  submissions.forEach(s => {
+    promptLines.push(`userId: ${s.userId}\n解答: ${s.text}`);
+  });
+  promptLines.push(
+    "",
+    "各生徒について、userId・0〜10の整数のscore・生徒に向けた日本語の簡潔な評価理由reasonを配列で返してください。全員分を必ず含めてください。"
+  );
+
+  const parts = [{ text: promptLines.join("\n") }];
+  if (imageUrl) {
+    try {
+      const { mimeType, base64 } = await fetchImageAsBase64(imageUrl);
+      parts.push({ inlineData: { mimeType, data: base64 } });
+    } catch (error) {
+      console.error("問題画像の取得に失敗しました:", error);
+    }
+  }
+
+  // ★ 候補モデルを順に試し、失敗したら次のモデルにフォールバックする
+  let lastError = null;
+  for (const model of GEMINI_MODEL_CANDIDATES) {
+    try {
+      return await callGeminiForBatchGrading(model, apiKey, parts);
+    } catch (error) {
+      console.error(`Gemini一括採点エラー(モデル: ${model}):`, error);
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Gemini APIでの採点にすべて失敗しました。");
+}
+
+// ★ 指定したモデルでGeminiに一括採点(複数生徒分)を依頼する
+async function callGeminiForBatchGrading(model, apiKey, parts) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                userId: { type: "string" },
+                score: { type: "integer" },
+                reason: { type: "string" }
+              },
+              required: ["userId", "score", "reason"]
+            }
+          }
+        }
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(`Gemini APIエラー(${model}): ${response.status} ${errorBody}`);
+  }
+
+  const data = await response.json();
+  const resultText =
+    data &&
+    data.candidates &&
+    data.candidates[0] &&
+    data.candidates[0].content &&
+    data.candidates[0].content.parts &&
+    data.candidates[0].content.parts[0] &&
+    data.candidates[0].content.parts[0].text;
+  if (!resultText) throw new Error(`Gemini APIから採点結果が得られませんでした。(${model})`);
+
+  const parsed = JSON.parse(resultText);
+  if (!Array.isArray(parsed)) throw new Error(`採点結果の形式が不正です。(${model})`);
+
+  return parsed.map(item => ({
+    userId: String(item.userId),
+    score: Math.max(0, Math.min(10, Math.round(Number(item.score) || 0))),
+    reason: String(item.reason || "")
+  }));
+}
+
+function handleNextButton() {
+  const index = sessionData.currentQuestionIndex;
+  const isLast = index >= problemsData.length - 1;
+  if (isLast) {
+    // ★ status を "finished" にした時点で、募集中の判定(appScript.js側)は自動的に外れる
+    rtdbUpdate(sessionRef, { status: "finished" });
+    bumpBookUpdatedAt();
+    makeBookPublic();
+    markParticipantsAsSolved();
+    grantSpecialLivePrize();
+  } else {
+    nextQuestionButton.disabled = true;
+    beginQuestion(index + 1).finally(() => {
+      nextQuestionButton.disabled = false;
+    });
+  }
+}
+
+// ★ 「募集中/開始済み」表示が消えるタイミング(結果発表・中止)で、問題集の更新日時を今にしておく
+function bumpBookUpdatedAt() {
+  updateDoc(doc(db, "ProblemPosting", "books", "data", bookId), { updatedAt: serverTimestamp() })
+    .catch(error => console.error("更新日時の更新に失敗しました:", error));
+}
+
+// ★ ライブが終了(結果発表画面に到達)したら、この問題集の非公開設定を解除する(主催者側で自動的に公開する)
+function makeBookPublic() {
+  updateDoc(doc(db, "ProblemPosting", "books", "data", bookId), { isPrivate: false })
+    .catch(error => console.error("公開設定の更新に失敗しました:", error));
+}
+
+// ★ 最終結果発表まで到達したら、参加者全員を「解いた人」に追加する(通常の解答モードと同様)
+function markParticipantsAsSolved() {
+  const participantIds = Object.keys(sessionData.participants || {});
+  if (participantIds.length === 0) return;
+  updateDoc(doc(db, "ProblemPosting", "books", "data", bookId), { solvedBy: arrayUnion(...participantIds) })
+    .catch(error => console.error("解答済み記録の更新に失敗しました:", error));
+}
+
+// ★ スペシャルライブなら、最終順位1位の参加者(0点は対象外)に景品を付与する。
+//   景品の実体は、Firestoreのユーザーデータに「景品の付与日時(タイムスタンプ)」を持たせるだけ。
+//   付与日時からPRIZE_DURATION_MS以内であれば、名前が管理者と同じように光る(ただしアニメーションは半分の速度)。
+//   (PRIZE_DURATION_MSはファイル冒頭の虹色クラス判定用の定義を共用している)
+function grantSpecialLivePrize() {
+  if (!sessionData.isSpecial) return;
+
+  const ranking = buildRanking(); // 0点の参加者は既に除外済み
+  const winner = ranking[0];
+  if (!winner) return; // 0点でない参加者がいなければ、誰にも付与しない
+
+  setDoc(doc(db, "users_random", winner.uid), { prizeGrantedAt: serverTimestamp() }, { merge: true })
+    .catch(error => console.error("スペシャルライブの景品付与に失敗しました:", error));
+}
+
+// ★ 「中止」= 途中経過を見せず、その場でブチッと終わらせる。待機中でも進行中でも同じ動作・同じ文言に統一
+async function cancelRecruitment(triggerButton) {
+  const button = triggerButton || cancelRecruitmentButton;
+  if (!(await LiveDialog.confirm("ライブを中止しますか？", { danger: true, okText: "中止する" }))) return;
+  button.disabled = true;
+  try {
+    await rtdbUpdate(sessionRef, { status: "cancelled" });
+    bumpBookUpdatedAt();
+    window.location.href = "./app.html";
+  } catch (error) {
+    console.error(error);
+    LiveDialog.alert("募集の中止に失敗しました。");
+    button.disabled = false;
+  }
+}
+
+function finishAndGoHome() {
+  window.location.href = "./app.html";
+}
+
+// ★ 結果発表後、主催者が「ライブを終了する」を押したときの確認〜セッション終了処理。
+//   status を "ended" にすることで、参加者側は「ホストがライブを終了しました。」の専用画面に切り替わる。
+async function handleEndLiveClick() {
+  if (!(await LiveDialog.confirm("ライブを終了しますか？", { okText: "終了する" }))) return;
+  finishedHomeButton.disabled = true;
+  try {
+    await rtdbUpdate(sessionRef, { status: "ended" });
+  } catch (error) {
+    console.error("ライブの終了処理に失敗しました:", error);
+  }
+  finishAndGoHome();
+}

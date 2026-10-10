@@ -1,0 +1,172 @@
+<html lang="ja">
+  
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>問題投稿</title>
+  <meta name="apple-mobile-web-app-capable" content="yes"> 
+  <link rel="icon" type="image/png" href="icon-512.png">
+  <link rel="apple-touch-icon" href="icon-512.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=BIZ+UDGothic:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="answerCardStyle.css">
+  <link rel="stylesheet" href="appDialogStyle.css">
+  
+  <link rel="manifest" href="manifest.json">
+  <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+</head>
+  
+<body>
+  <div id="loading-overlay">
+    <h1>loading...</h1>
+    <p id="loading-status-text">カードを読み込んでいます｡</p>
+    <div id="loading-progress-bar" class="loading-progress-bar">
+      <div id="loading-progress-bar-fill" class="loading-progress-bar-fill"></div>
+    </div>
+  </div>
+
+  <div id="no-permission-overlay" class="hidden">
+    <h1>解答できません</h1>
+    <p>この暗記カードを解く権限がありません。</p>
+    <a href="./app.html#cards" class="answer-next-button">ホームにもどる</a>
+  </div>
+
+  <div id="user-list-modal" class="modal-overlay hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <p class="title">ユーザー一覧</p>
+        <span id="user-list-modal-close" class="close-button">&times;</span>
+      </div>
+      <div id="user-list-area"></div>
+    </div>
+  </div>
+
+  <div id="profile-modal" class="modal-overlay hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <p class="title">プロフィール</p>
+        <span id="profile-modal-close" class="close-button">&times;</span>
+      </div>
+      <div id="profile-area">
+        <div class="profile-avatar-wrap">
+          <div id="profile-avatar-holder"></div>
+          <input type="file" id="profile-avatar-input" accept="image/*" class="visually-hidden-input">
+          <button id="profile-avatar-remove-button" class="hidden">画像を削除</button>
+        </div>
+
+        <p id="profile-name">取得中...</p>
+        <input id="profile-name-input" class="hidden" type="text" placeholder="ユーザーネーム">
+
+        <p class="profile-label">ステータスメッセージ</p>
+        <div id="profile-text">取得中...</div>
+        <textarea id="profile-text-edit" class="hidden" placeholder="自己紹介を入力してください"></textarea>
+
+        <div class="profile-edit-button-row">
+          <button id="profile-cancel-button" class="hidden">キャンセル</button>
+          <button id="profile-edit-button" class="hidden">プロフィールを編集</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="drawerOverlay" class="drawer-overlay"></div>
+  <div id="accountSettingsDrawer" class="drawer">
+    <div class="drawer-header">
+      <p>アカウント設定</p>
+      <span id="drawerCloseButton" class="drawer-close-button">&times;</span>
+    </div>
+    <div class="drawer-content">
+      <div class="drawer-section">
+        <p class="title">現在のユーザー</p>
+        <p>ID: <strong id="drawerUserId">取得中...</strong><span></span></p>
+        <p>ユーザーネーム: <strong id="drawerUsername">取得中...</strong></p>
+
+        <button id="drawer-edit-profile-button" class="normal-button" style="margin-bottom: 1rem;">プロフィールを編集</button>
+        <button id="drawer-user-list-button" class="normal-button hidden" style="margin-bottom: 1rem;">ユーザー一覧</button>
+        <button id="enable-push-button" class="normal-button" style="margin-bottom: 1rem; display: none;">通知をオンにする</button>
+        <button id="logout-button" class="logout-button normal-button">ログアウト</button>
+      </div>
+    </div>
+  </div>
+  
+  <header id="app-header">
+    <div id="title-area">
+      <p id="header-title">問題投稿</p>
+    </div>
+    <div id="user-data">
+      <button id="setting-button">アカウント情報</button>
+    </div>
+  </header>
+  
+  <main>
+    <div class="books-container">
+      <button id="home-button" class="home-button" aria-label="ホームへもどる">&larr; ホームへもどる</button>
+      <div id="title-area">
+        <p id="title-area-title">loading...</p>
+        <div id="gauge-area">
+          <div class="gauge-container">
+            <div id="gauge-bar" class="gauge-bar"></div>
+          </div>
+          <p id="title-area-count"><span id="now-problem-count"></span>/<span id="all-problems-count"></span></p>
+        </div>
+      </div>
+
+      <div id="card-container" class="card-container hidden">
+        <div class="flip-card-container" id="flip-card-container">
+          <div class="flip-card-peek" id="flip-card-peek">
+            <p id="peek-card-text"></p>
+            <button id="peek-card-button" class="peek-card-button" tabindex="-1" disabled></button>
+          </div>
+          <div class="flip-card-slide" id="flip-card-slide">
+            <div class="flip-card-inner" id="flip-card">
+              <div class="flip-card-front">
+                <p id="card-front-text">loading...</p>
+                <button id="show-back-button">答えをみる</button>
+              </div>
+              <div class="flip-card-back">
+                <p id="card-back-text">loading...</p>
+                <button id="next-card-button">次へ</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <button id="favorite-button" type="button" class="favorite-button">☆ お気に入りに追加</button>
+        <p class="swipe-hint">左右にスワイプでも操作できます</p>
+      </div>
+
+      <div id="card-finished-area" class="card-finished-area hidden">
+        <p class="card-finished-title">終了！</p>
+        <button id="restart-shuffled-button" class="secondary-next-button">シャッフルして最初から</button>
+        <button id="write-impression-button" class="secondary-next-button">感想を書く</button>
+        <button id="finished-home-button" class="answer-next-button">ホームにもどる</button>
+      </div>
+    </div>
+  </main>
+
+  <div id="impression-modal" class="modal-overlay top-sheet hidden">
+    <div class="modal-content top-sheet-content">
+      <div class="modal-header">
+        <p class="title">感想を書く</p>
+        <span id="impression-modal-close" class="close-button">&times;</span>
+      </div>
+      <textarea id="impression-input" rows="5" placeholder="この暗記カードの感想を書いてみましょう"></textarea>
+      <button id="impression-save-button" class="answer-next-button">保存する</button>
+    </div>
+  </div>
+
+  <div id="app-dialog-modal" class="modal-overlay hidden">
+    <div class="modal-content app-dialog-content">
+      <p id="app-dialog-title" class="app-dialog-title hidden"></p>
+      <p id="app-dialog-message" class="app-dialog-message"></p>
+      <div class="app-dialog-actions">
+        <button id="app-dialog-ok-button">OK</button>
+        <button id="app-dialog-cancel-button" class="hidden">キャンセル</button>
+      </div>
+    </div>
+  </div>
+  
+  <script src="appDialog.js"></script>
+  <script type="module" src="answerCardScript.js"></script>
+</html>

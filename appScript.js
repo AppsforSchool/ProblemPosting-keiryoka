@@ -1,0 +1,2166 @@
+import { firestoreTransport, firestoreCacheMode, authStorageMode, hedged, auth, db, rtdb, onAuthStateChanged, signOut, collection, doc, getDoc, getDocs, setDoc, query, orderBy, serverTimestamp, rtdbRef, rtdbGet, rtdbSet, rtdbServerTimestamp, onChildAdded, onChildChanged, onChildRemoved } from "./firebase.js";
+import { setLoadingStage, watchLoadingStall, finishLoading, createReadTracker } from "./loading.js";
+import { perfMark, perfStart, perfNote } from "./perf.js";
+import { initPush, logoutPush, setupPushButton, sendPushToAllOthers } from "./notify.js";
+
+perfMark("JSモジュールの読み込み・実行開始（HTML解析・Firebase等の取得）");
+
+const DEFAULT_RECRUIT_TIME_LIMIT_SECONDS = 20; // ★ 初期値。主催者は待機画面(liveHost.html)で変更できる
+
+// ★ iPadなどコンソールが見られない環境向けに、想定外のエラーをアラートで表示する
+window.addEventListener("error", event => {
+  const message = (event.error && event.error.message) || event.message || "不明なエラー";
+  console.error("Uncaught error:", event.error || event.message);
+  alert("予期しないエラーが発生しました:\n" + message);
+});
+window.addEventListener("unhandledrejection", event => {
+  const reason = event.reason;
+  const message = (reason && reason.message) || String(reason);
+  console.error("Unhandled promise rejection:", reason);
+  alert("予期しないエラーが発生しました:\n" + message);
+});
+
+const STACK_ICON_SVG = `<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+  <rect x="3" y="1" width="11" height="8" rx="1.4" opacity="0.45"></rect>
+  <rect x="1.5" y="4" width="11" height="8" rx="1.4" opacity="0.7"></rect>
+  <rect x="0" y="7" width="11" height="8" rx="1.4"></rect>
+</svg>`;
+const subjectIdList = [
+  "不明",
+  "国語",
+  "数学",
+  "理科",
+  "英語",
+  "社会(歴史)",
+  "社会(地理)",
+  "社会(公民)",
+  "保健体育(保健)",
+  "保健体育(実技)"
+];
+const gradeIdList = ["不明", "1年", "2年", "3年", "総合"];
+
+let loadingOverlay;
+let myUid = "";
+let myUserId = "";
+let meIsAdmin = false;
+
+let userDataCache = {};
+function getUserCache(userId) {
+  return userDataCache[userId] || null;
+}
+function setUserCache(userId, data) {
+  userDataCache[userId] = Object.assign({}, userDataCache[userId] || {}, data);
+  return userDataCache[userId];
+}
+// ★ ローディングオーバーレイ下部の段階テキストと、その下の進捗バーをまとめて更新する
+
+// ★ Firestoreのタイムスタンプ(またはミリ秒数値)を、比較に使いやすいミリ秒数値へ揃える
+function toMillisOrNull(value) {
+  if (!value) return null;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value === "number") return value;
+  return null;
+}
+
+// ★ スペシャルライブ優勝の景品(名前が光る)の持続時間。liveHostScript.js側の値と揃える
+const PRIZE_DURATION_MS = 10 * 60 * 1000; // 10分間
+
+// ★ スペシャルライブ優勝の景品(名前が光る)が、現在も有効期限内かどうか
+//   ユーザーデータには「付与日時(prizeGrantedAt)」だけを保持し、期限はここで都度計算する
+function hasActivePrize(cached) {
+  const grantedAt = cached && cached.prizeGrantedAt;
+  return typeof grantedAt === "number" && grantedAt + PRIZE_DURATION_MS > Date.now();
+}
+
+let bookCache = {};
+
+// ★ 「募集中」はFirestoreのフィールドではなく、RTDBの liveSessions を唯一の情報源として判定する
+let liveSessionsCache = {}; // bookId -> セッションデータ(status が finished/cancelled 以外のもののみ保持)
+let liveSessionsInitialLoadDone = false;
+// ★ 初回読み込み時点で既に募集中だったが、まだ bookCache に無い(非公開の他人の問題集など)ものを覚えておき、
+//   一覧に初めて追加されたタイミングで一度だけハイライトするための集合
+let bookIdsToHighlightOnce = new Set();
+// ★ RTDBの child_added は、接続時に既存の全データに対しても発火する仕様のため、
+//   .once("value")の処理より先に child_added 側が動いてしまうことがある(タイミングはSDK内部の実装依存で保証されない)。
+//   そのレース条件で「まだbookIdsToHighlightOnceに登録される前に、既にbookCacheへ追加されてしまい、
+//   結局どちらの分岐でもハイライトされない」という抜け漏れを防ぐため、
+//   実際にハイライトを発火させたbookIdを記録し、二重発火だけを防ぐ
+let highlightedOnceBookIds = new Set();
+
+function isActiveSessionStatus(status) {
+  return !!status && status !== "finished" && status !== "cancelled" && status !== "ended";
+}
+
+let deckCache = {};
+let imgbbApiKeyCache = null;
+
+// ★ ImgBBへの画像アップロード（チャットサイトと同じ仕様：system_keys/imgbb からAPIキーを取得してアップロードし、URLを保存する）
+async function uploadImageToImgbb(file) {
+  if (!imgbbApiKeyCache) {
+    const keyDoc = await hedged(() => getDoc(doc(db, "system_keys", "imgbb")));
+    if (!keyDoc.exists()) {
+      throw new Error("APIキーの設定が見つかりません。セキュリティルールかドキュメントを確認してください。");
+    }
+    imgbbApiKeyCache = keyDoc.data().apiKey;
+  }
+
+  const formData = new FormData();
+  formData.append("image", file);
+
+  const response = await fetch(`https://api.imgbb.com/1/upload?key=${imgbbApiKeyCache}`, {
+    method: "POST",
+    body: formData
+  });
+
+  const result = await response.json();
+  if (!result.success) {
+    throw new Error("画像のアップロードに失敗しました。");
+  }
+  return result.data.url;
+}
+
+// ★ アバターの頭文字を安全に取り出すヘルパー
+function getInitial(name) {
+  if (!name) return "?";
+  return Array.from(name.trim())[0] || "?";
+}
+
+// ★ 頭文字アバター、または画像アバターを生成するヘルパー（size: "small" | "large" | 省略で通常サイズ）
+function createAvatar(name, size, imageUrl) {
+  if (imageUrl) {
+    const img = document.createElement("img");
+    img.loading = "lazy"; // ★ 一覧の下のほうのアバターまで、初回表示で待たない
+    img.decoding = "async";
+    img.classList.add("avatar-circle");
+    if (size === "small") img.classList.add("small");
+    if (size === "large") img.classList.add("large");
+    img.src = imageUrl;
+    img.alt = name || "";
+    return img;
+  }
+  const avatar = document.createElement("div");
+  avatar.classList.add("avatar-circle");
+  if (size === "small") avatar.classList.add("small");
+  if (size === "large") avatar.classList.add("large");
+  avatar.textContent = getInitial(name);
+  return avatar;
+}
+
+// ★ 「解いた人」/「参加者」のアバター一覧を作る(問題集一覧のカードと、問題集モーダルの両方で使う共通部品)
+// ★ 募集中の問題集を、吹き出し風のバブルで表示する(ラベル+参加人数を上部、募集メッセージを下部に)
+function buildRecruitBubble(session) {
+  const bubble = document.createElement("div");
+  bubble.classList.add("recruit-bubble");
+
+  const participantCount = Object.keys(session.participants || {}).length;
+  const baseLabel = session.isSpecial ? "スペシャルライブ・募集中" : "募集中";
+
+  const label = document.createElement("p");
+  label.classList.add("recruit-bubble-label");
+  label.textContent = `${baseLabel}（${participantCount}人が参加中）`;
+  bubble.appendChild(label);
+
+  const message = document.createElement("p");
+  message.classList.add("recruit-bubble-message");
+  message.textContent = (session.recruitComment || "").trim() || "(コメントはありません)";
+  bubble.appendChild(message);
+
+  return bubble;
+}
+
+function buildSolvedByArea(id, book, isCurrentlyWaiting, session, contentType) {
+  const participantIds = isCurrentlyWaiting ? Object.keys((session && session.participants) || {}) : [];
+  const solvedBy = isCurrentlyWaiting ? participantIds : (book[6] || []);
+
+  const solvedByArea = document.createElement("div");
+  solvedByArea.classList.add("solved-by-area");
+
+  const solvedByLabel = document.createElement("span");
+  solvedByLabel.classList.add("solved-by-label");
+  solvedByLabel.textContent = isCurrentlyWaiting ? "参加者:" : "解いた人:";
+  solvedByArea.appendChild(solvedByLabel);
+
+  if (solvedBy.length > 0) {
+    const stack = document.createElement("div");
+    stack.classList.add("solved-by-stack");
+
+    const MAX_SHOWN = 4;
+    solvedBy.slice(0, MAX_SHOWN).forEach(userId => {
+      const cached = getUserCache(userId) || {};
+      const avatar = createAvatar(cached.name, "small", cached.imageUrl);
+      avatar.classList.add("solved-by-avatar");
+      stack.appendChild(avatar);
+    });
+    if (solvedBy.length > MAX_SHOWN) {
+      const overflow = document.createElement("div");
+      overflow.classList.add("avatar-circle", "small", "solved-by-avatar", "solved-by-overflow");
+      overflow.textContent = "…";
+      stack.appendChild(overflow);
+    }
+
+    solvedByArea.appendChild(stack);
+    solvedByArea.addEventListener("click", e => {
+      e.stopPropagation();
+      openSolvedModal(id, isCurrentlyWaiting ? "participants" : (contentType || "book"));
+    });
+  } else {
+    const emptyText = document.createElement("span");
+    emptyText.classList.add("solved-by-empty-text");
+    emptyText.textContent = isCurrentlyWaiting ? "まだ参加者がいません" : "解いた人はまだいません";
+    solvedByArea.appendChild(emptyText);
+  }
+
+  return solvedByArea;
+}
+
+
+async function ensureUserCached(userId) {
+  if (getUserCache(userId)) return;
+
+  const userSnapshot = await hedged(() => getDoc(doc(db, "users_random", userId)));
+  if (userSnapshot.exists()) {
+    const userData = userSnapshot.data();
+    setUserCache(userId, {
+      name: userData.name || "名前未設定",
+      isAdmin: userData.isAdmin || false,
+      imageUrl: userData.imageUrl || "",
+      profileText: userData.profileText || "",
+      prizeGrantedAt: toMillisOrNull(userData.prizeGrantedAt)
+    });
+  } else {
+    setUserCache(userId, { name: "不明なユーザー", isAdmin: false, imageUrl: "", profileText: "", prizeGrantedAt: null });
+  }
+}
+
+let drawerOverlay;
+let accountSettingsDrawer;
+let drawerCloseButton;
+let accountSettingsButton;
+let drawerUserId;
+let drawerUsername;
+let drawerLogoutButton;
+let drawerEditProfileButton;
+let drawerUserListButton;
+
+let subjectSelect;
+let gradeSelect;
+let sortOrderSelect;
+let solvedFilterSelect;
+let contentTypeSelect;
+
+document.addEventListener("DOMContentLoaded", () => {
+  drawerOverlay = document.getElementById("drawerOverlay");
+  accountSettingsDrawer = document.getElementById("accountSettingsDrawer");
+  drawerCloseButton = document.getElementById("drawerCloseButton");
+  accountSettingsButton = document.getElementById("setting-button");
+
+  drawerUserId = document.getElementById("drawerUserId");
+  drawerUsername = document.getElementById("drawerUsername");
+  drawerLogoutButton = document.getElementById("logout-button");
+  drawerEditProfileButton = document.getElementById("drawer-edit-profile-button");
+  drawerUserListButton = document.getElementById("drawer-user-list-button");
+
+  accountSettingsButton.addEventListener("click", openDrawer);
+  drawerCloseButton.addEventListener("click", closeDrawer);
+  drawerOverlay.addEventListener("click", closeDrawer);
+  drawerLogoutButton.addEventListener("click", handleLogout);
+  drawerEditProfileButton.addEventListener("click", () => {
+    closeDrawer();
+    openProfileModal(myUserId, true);
+  });
+  drawerUserListButton.addEventListener("click", () => {
+    closeDrawer();
+    openUserListModal();
+  });
+
+  subjectSelect = document.getElementById("subject-select");
+  gradeSelect = document.getElementById("grade-select");
+  sortOrderSelect = document.getElementById("sort-order-select");
+  solvedFilterSelect = document.getElementById("solved-filter-select");
+  contentTypeSelect = document.getElementById("content-type-select");
+
+  subjectSelect.addEventListener("change", handleFilterChange);
+  gradeSelect.addEventListener("change", handleFilterChange);
+  sortOrderSelect.addEventListener("change", handleFilterChange);
+  solvedFilterSelect.addEventListener("change", handleFilterChange);
+  contentTypeSelect.addEventListener("change", () => {
+    resetHashToCurrentType();
+    handleFilterChange();
+  });
+});
+
+function handleFilterChange(animateBookId) {
+  const isCardMode = contentTypeSelect.value === "cards";
+
+  if (isCardMode) {
+    makeDisplayCards(subjectSelect.value, gradeSelect.value, sortOrderSelect.value, solvedFilterSelect.value);
+  } else {
+    makeDisplayBooks(subjectSelect.value, gradeSelect.value, sortOrderSelect.value, solvedFilterSelect.value, animateBookId);
+  }
+}
+
+function openDrawer() {
+  accountSettingsDrawer.classList.add("is-open");
+  drawerOverlay.classList.add("is-open");
+}
+function closeDrawer() {
+  accountSettingsDrawer.classList.remove("is-open");
+  drawerOverlay.classList.remove("is-open");
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  perfMark("DOMContentLoaded（DOM構築完了まで）");
+  loadingOverlay = document.getElementById("loading-overlay");
+  setLoadingStage("Firebaseに接続しています｡", 10, 20);
+  watchLoadingStall(); // ★ 読み込みが長引いたら、止まっている段階と「ログイン情報をリセット」ボタンを表示する
+
+  onAuthStateChanged(auth, async (user) => {
+    if (user) {
+      perfMark("ログイン状態の確定（Firebase Auth）");
+      myUserId = user.email.split("@")[0];
+      drawerUserId.textContent = myUserId;
+
+      // ★ プッシュ通知の初期化（失敗しても一覧の表示には影響させない。結果は待たない）
+      perfNote(`Firestore通信方式: ${firestoreTransport} / 永続キャッシュ: ${firestoreCacheMode} / ログイン情報の保存先: ${authStorageMode}`);
+      const endPushPerf = perfStart("OneSignal初期化（キー取得・SDK・login）");
+      Promise.resolve(initPush(db, myUserId)).then(endPushPerf, endPushPerf);
+      setupPushButton("enable-push-button");
+
+      // ★ 以下の4つの読み取りは互いに依存しない（非公開の絞り込みは取得後にクライアント側で行う）ので、
+      //   順番に待たず同時に発行する。1つ終わるごとに進捗バーを実際の完了数で進める。
+      //   hedged() は、読み取りが4秒返らないときに同じ読み取りをもう1本出し直す（先に返ったほうを使う）
+      setLoadingStage("ユーザー情報・一覧を読み込んでいます｡", 15, 80);
+      const trackRead = createReadTracker(4, 15, 80);
+      const userSnapshotPromise = trackRead("ユーザー情報", hedged(() => getDoc(doc(db, "users_random", myUserId))));
+      const booksSnapshotPromise = trackRead("問題集一覧", hedged(() => getDocs(query(collection(db, "ProblemPosting", "books", "data"), orderBy("createdAt", "desc")))));
+      const cardsSnapshotPromise = trackRead("暗記カード一覧", hedged(() => getDocs(query(collection(db, "ProblemPosting", "cards", "data"), orderBy("createdAt", "desc")))));
+      // ★ 作成者・解答者の名前を出すためのユーザー情報は、身内サイト(約8人)なので全件を1回で取る。
+      //   これで「一覧が届いてから、ユーザーごとに getDoc を出す」往復が不要になる。失敗しても個別取得で補える
+      const allUsersPromise = trackRead("全ユーザー情報", hedged(() => getDocs(collection(db, "users_random")))).catch(error => {
+        console.warn("全ユーザー情報の一括取得に失敗（個別取得で補います）:", error);
+        return null;
+      });
+
+      const userSnapshot = await userSnapshotPromise;
+      const userData = userSnapshot.data();
+      perfMark("自分のユーザー情報の取得（Firestore）");
+      setUserCache(myUserId, {
+        name: userData.name,
+        isAdmin: userData.isAdmin,
+        imageUrl: userData.imageUrl || "",
+        profileText: userData.profileText || "",
+        prizeGrantedAt: toMillisOrNull(userData.prizeGrantedAt)
+      });
+      meIsAdmin = userData.isAdmin || false;
+      drawerUsername.textContent = userData.name;
+      if (meIsAdmin) {
+        drawerUsername.classList.add("admin");
+      } else if (hasActivePrize(getUserCache(myUserId))) {
+        drawerUsername.classList.add("prize");
+      }
+      drawerUserListButton.classList.toggle("hidden", !meIsAdmin);
+
+      myUid = userData.uid;
+      maybeShowNotice(userData.lastOpenedAt); // ★ 最終確認時刻に応じて、お知らせモーダルを表示する(結果を待たずに進める)
+
+      // ★ 非公開の絞り込みは meIsAdmin が必要なので、自分のユーザー情報が届いてから一覧を整理する
+      const [bookUserIds, cardUserIds] = await Promise.all([loadProblemBooks(booksSnapshotPromise), loadCardDecks(cardsSnapshotPromise)]);
+      perfMark("問題集・暗記カード一覧の到着待ちと整理（Firestore）");
+
+      const allUsersSnapshot = await allUsersPromise;
+      if (allUsersSnapshot) {
+        allUsersSnapshot.docs.forEach(userDoc => {
+          const data = userDoc.data() || {};
+          setUserCache(userDoc.id, {
+            name: data.name || "名前未設定",
+            isAdmin: data.isAdmin || false,
+            imageUrl: data.imageUrl || "",
+            profileText: data.profileText || "",
+            prizeGrantedAt: toMillisOrNull(data.prizeGrantedAt)
+          });
+        });
+      }
+      // ★ 一括取得に含まれなかった人(削除済みユーザーなど)だけ個別に取得する(キャッシュ済みなら即returnする)
+      await Promise.all(Array.from(new Set([...bookUserIds, ...cardUserIds])).map(userId => ensureUserCached(userId)));
+      perfMark("全ユーザー情報の到着待ち・キャッシュ（Firestore）");
+
+      setLoadingStage("表示を準備しています｡", 90);
+      if (window.location.hash) {
+        initializeViewFromHash();
+      } else {
+        contentTypeSelect.value = "books";
+        makeDisplayBooks("all", "all", sortOrderSelect.value, "all");
+        resetHashToCurrentType(); // ★ 履歴を汚さないよう置き換えで #books を補っておく
+      }
+      perfNote(`問題集: ${Object.keys(bookCache).length}件 / 暗記カード: ${Object.keys(deckCache).length}件 / 管理者: ${meIsAdmin ? "はい" : "いいえ"}`);
+      perfMark("一覧のDOM構築");
+      finishLoading({ isAdmin: meIsAdmin, page: "app.html（問題集一覧）", myUserId }); // ★ 管理者にだけ計測結果を表示
+      updateLastChecked();
+      attachLiveSessionsListener();
+    } else {
+      console.log("logout");
+      window.location.href = "./index.html";
+    }
+  });
+});
+
+// ★ 最終アクセス日時の更新。優先度が低いので他の読み込みを妨げないよう、待たずに投げっぱなしにする
+function updateLastChecked() {
+  setDoc(doc(db, "users_random", myUserId), { lastOpenedAt: serverTimestamp() }, { merge: true })
+    .catch(error => console.error("最終アクセス日時の更新エラー:", error));
+}
+
+// ★ 最終確認時刻が指定日時より前(=未確認)なら、最新のお知らせをモーダルで表示する。
+//   一度表示されれば、直後にupdateLastChecked()で最終確認時刻が更新されるため、次回以降は表示されない
+const NOTICE_CUTOFF_MS = new Date(2026, 8, 1, 0, 0, 0).getTime(); // 2026/09/01 0:00
+function maybeShowNotice(lastOpenedAt) {
+  const lastMillis = toMillisOrNull(lastOpenedAt) || 0;
+  if (lastMillis < NOTICE_CUTOFF_MS) {
+    AppDialog.alert(
+      "ゲームモード(β版)が公開されました！\nゲーム形式で、複数人で同時に問題を解くことができます。",
+      { title: "お知らせ" }
+    );
+  }
+}
+
+const handleLogout = async () => {
+  const isConfirmed = await AppDialog.confirm("ログアウトしますか？", { okText: "ログアウトする", danger: true });
+  if (isConfirmed) {
+    try {
+      await logoutPush();
+      await signOut(auth);
+      console.log("ログアウトしました！");
+      await AppDialog.alert("ログアウトしました。");
+      window.location.href = "./index.html";
+    } catch (error) {
+      console.error("ログアウトエラー:", error);
+      await AppDialog.alert("ログアウトに失敗しました。");
+    }
+  }
+};
+
+async function loadProblemBooks(snapshotPromise) {
+  try {
+    const querySnapshot = await snapshotPromise;
+
+    const userIdsToCache = new Set();
+
+    for (const doc of querySnapshot.docs) {
+      const data = doc.data();
+      const bookId = doc.id;
+      const title = data.title || "タイトルがありません";
+      const description = data.description || "説明文がありません";
+      let subjectId = data.subjectId || 0;
+      if (9 < subjectId) subjectId = 0;
+      let gradeId = data.gradeId || 0;
+      if (4 < gradeId) gradeId = 0;
+      const problemCount = data.problemCount || 0;
+      const makerUserId = data.madeBy || "";
+      const solvedBy = data.solvedBy || [];
+      const shuffleProblems = !!data.shuffleProblems;
+      const isPrivate = !!data.isPrivate;
+      const createdAtMillis = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : 0;
+      const updatedAtMillis = data.updatedAt && data.updatedAt.toMillis ? data.updatedAt.toMillis() : createdAtMillis;
+
+      // ★ 非公開の問題集は作成者本人と管理者にのみ表示する。
+      //   「みんなで解く」募集中かどうかはRTDB(liveSessions)側で別途判定し、
+      //   募集中の他人の非公開問題集は attachLiveSessionsListener() が動的に追加する
+      if (isPrivate && makerUserId !== myUserId && !meIsAdmin) continue;
+
+      bookCache[bookId] = [
+        title,
+        description,
+        subjectId,
+        gradeId,
+        problemCount,
+        makerUserId,
+        solvedBy,
+        createdAtMillis,
+        updatedAtMillis,
+        shuffleProblems,
+        isPrivate
+      ];
+
+      userIdsToCache.add(makerUserId);
+      solvedBy.forEach(solverId => userIdsToCache.add(solverId));
+    }
+
+    // ★ ユーザー情報の並行取得は、呼び出し元(DOMContentLoaded)でloadCardDecks()の分とまとめて行う。
+    //   ここで完結させず呼び出し元に委譲することで、実際に完了したユーザー数に基づいた
+    //   本物の進捗表示(何人中何人終わったか)ができるようにしている
+    return userIdsToCache;
+  } catch (error) {
+    console.log(error);
+    await AppDialog.alert(String(error));
+    return new Set();
+  }
+}
+
+// ★ RTDBの liveSessions を監視し、「募集中」の状態をリアルタイムに一覧へ反映する。
+//   ・自分の問題集や公開問題集は既に bookCache にあるので、バッジと並び順だけ更新すればよい
+//   ・他人の非公開問題集が新たに募集を開始した場合は、Firestoreから該当の問題集を取得して一覧に追加する
+//   ・募集が終わった(finished/cancelled)場合、他人の非公開問題集なら一覧から取り除く
+function attachLiveSessionsListener() {
+  const sessionsRef = rtdbRef(rtdb, "liveSessions");
+  let errorAlertShown = false;
+  const reportError = error => {
+    console.error("募集状況の取得に失敗しました:", error);
+    if (!errorAlertShown) {
+      errorAlertShown = true;
+      AppDialog.alert(
+        "募集中の問題集の情報取得に失敗しました。RTDBのセキュリティルールで liveSessions 一覧の読み取りが許可されているかご確認ください。\n" +
+          (error && error.message ? error.message : error)
+      );
+    }
+  };
+
+  rtdbGet(sessionsRef)
+    .then(snap => {
+      const all = snap.val() || {};
+      // ★ 初回表示時、既に募集中のものはすべて強調したい。
+      //   bookCacheに既にある(公開/自分の問題集など)ものはこの場でハイライトし、
+      //   まだ無いもの(非公開の他人の問題集など)は、一覧に追加されたタイミングで改めてハイライトする
+      const highlightNow = new Set();
+      Object.entries(all).forEach(([bookId, session]) => {
+        if (isActiveSessionStatus(session && session.status)) {
+          liveSessionsCache[bookId] = session;
+          if (highlightedOnceBookIds.has(bookId)) {
+            // ★ 既にchild_added側のレース条件でハイライト済みなら、ここで重複して発火させない
+          } else if (bookCache[bookId]) {
+            highlightNow.add(bookId);
+            highlightedOnceBookIds.add(bookId);
+          } else {
+            bookIdsToHighlightOnce.add(bookId);
+          }
+        }
+      });
+      liveSessionsInitialLoadDone = true;
+      handleFilterChange(highlightNow);
+    })
+    .catch(reportError);
+
+  onChildAdded(sessionsRef, snap => handleLiveSessionUpdate(snap.key, snap.val()), reportError);
+  onChildChanged(sessionsRef, snap => handleLiveSessionUpdate(snap.key, snap.val()), reportError);
+  onChildRemoved(sessionsRef, snap => handleLiveSessionUpdate(snap.key, null), reportError);
+}
+
+async function handleLiveSessionUpdate(bookId, session) {
+  const wasActive = isActiveSessionStatus(liveSessionsCache[bookId] && liveSessionsCache[bookId].status);
+  const isActive = isActiveSessionStatus(session && session.status);
+
+  if (isActive) {
+    liveSessionsCache[bookId] = session;
+  } else {
+    delete liveSessionsCache[bookId];
+  }
+
+  // ★ 初回読み込みが終わったあとに「非アクティブ→アクティブ」になった時だけ新規開始として扱う
+  const justStarted = liveSessionsInitialLoadDone && !wasActive && isActive;
+  const justEnded = wasActive && !isActive;
+  // ★ 初回読み込み時点で既に募集中だった問題集が、今まさに一覧へ初めて追加される場合もハイライトする。
+  //   (a) .once("value")側が先に処理を終えてbookIdsToHighlightOnceへ登録済みのケースに加えて、
+  //   (b) child_added が.once("value")より先に発火し、bookIdsToHighlightOnceへの登録が
+  //       まだ間に合っていないケース(初回読み込み中でまだbookCacheに無い)もここで拾う
+  const pendingInitialHighlight =
+    !highlightedOnceBookIds.has(bookId) &&
+    isActive &&
+    (bookIdsToHighlightOnce.has(bookId) || (!liveSessionsInitialLoadDone && !bookCache[bookId]));
+  if (pendingInitialHighlight) bookIdsToHighlightOnce.delete(bookId);
+  const highlightBookId = justStarted || pendingInitialHighlight ? bookId : null;
+  if (highlightBookId) highlightedOnceBookIds.add(bookId);
+
+  if (!bookCache[bookId]) {
+    if (isActive) {
+      await fetchAndAddBookToCache(bookId);
+      handleFilterChange(highlightBookId);
+    }
+    return;
+  }
+
+  if (justEnded) {
+    const book = bookCache[bookId];
+    const isPrivate = !!book[10];
+    const isMakerOrAdmin = book[5] === myUserId || meIsAdmin;
+    if (isPrivate && !isMakerOrAdmin) {
+      delete bookCache[bookId];
+    }
+  }
+
+  handleFilterChange(highlightBookId);
+
+  // ★ 問題集モーダルを開いている最中に募集開始/終了などが起きても、開いたままリアルタイムで反映する
+  if (settingModalType === "book" && settingModalBookId === bookId) {
+    if (bookCache[bookId]) {
+      applyRecruitModeToSettingModal(bookId);
+    } else {
+      // 非公開×他人の問題集が募集終了して見えなくなった場合は、開いたままのモーダルを閉じる
+      settingModal.classList.add("hidden");
+      resetHashToCurrentType();
+    }
+  }
+}
+
+async function fetchAndAddBookToCache(bookId) {
+  try {
+    const bookDocSnap = await hedged(() => getDoc(doc(db, "ProblemPosting", "books", "data", bookId)));
+    if (!bookDocSnap.exists()) return;
+    const data = bookDocSnap.data();
+    let subjectId = data.subjectId || 0;
+    if (9 < subjectId) subjectId = 0;
+    let gradeId = data.gradeId || 0;
+    if (4 < gradeId) gradeId = 0;
+    const makerUserId = data.madeBy || "";
+    const solvedBy = data.solvedBy || [];
+    const createdAtMillis = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : 0;
+    const updatedAtMillis = data.updatedAt && data.updatedAt.toMillis ? data.updatedAt.toMillis() : createdAtMillis;
+
+    bookCache[bookId] = [
+      data.title || "タイトルがありません",
+      data.description || "説明文がありません",
+      subjectId,
+      gradeId,
+      data.problemCount || 0,
+      makerUserId,
+      solvedBy,
+      createdAtMillis,
+      updatedAtMillis,
+      !!data.shuffleProblems,
+      !!data.isPrivate
+    ];
+
+    await Promise.all([makerUserId, ...solvedBy].map(userId => ensureUserCached(userId)));
+  } catch (error) {
+    console.error("問題集の取得に失敗しました:", error);
+  }
+}
+
+async function loadCardDecks(snapshotPromise) {
+  try {
+    const querySnapshot = await snapshotPromise;
+
+    const userIdsToCache = new Set();
+
+    for (const doc of querySnapshot.docs) {
+      const data = doc.data();
+      const deckId = doc.id;
+      const title = data.title || "タイトルがありません";
+      const description = data.description || "説明文がありません";
+      let subjectId = data.subjectId || 0;
+      if (9 < subjectId) subjectId = 0;
+      let gradeId = data.gradeId || 0;
+      if (4 < gradeId) gradeId = 0;
+      const cardCount = data.cardCount || 0;
+      const makerUserId = data.madeBy || "";
+      const allowFlip = !!data.allowFlip;
+      const isPrivate = !!data.isPrivate;
+      const solvedBy = data.solvedBy || [];
+      const createdAtMillis = data.createdAt && data.createdAt.toMillis ? data.createdAt.toMillis() : 0;
+      const updatedAtMillis = data.updatedAt && data.updatedAt.toMillis ? data.updatedAt.toMillis() : createdAtMillis;
+
+      // ★ 非公開の暗記カードは作成者本人と管理者にのみ表示する
+      if (isPrivate && makerUserId !== myUserId && !meIsAdmin) continue;
+
+      deckCache[deckId] = [
+        title,
+        description,
+        subjectId,
+        gradeId,
+        cardCount,
+        makerUserId,
+        solvedBy,
+        createdAtMillis,
+        updatedAtMillis,
+        allowFlip,
+        isPrivate
+      ];
+
+      userIdsToCache.add(makerUserId);
+      solvedBy.forEach(solverId => userIdsToCache.add(solverId));
+    }
+
+    // ★ loadProblemBooks()と同様、ユーザー情報の並行取得は呼び出し元に委譲する
+    return userIdsToCache;
+  } catch (error) {
+    console.log(error);
+    await AppDialog.alert(String(error));
+    return new Set();
+  }
+}
+
+// ★ animateTarget は単一のbookId文字列、または複数まとめてハイライトしたい場合のSetのどちらも受け付ける
+function shouldHighlightCard(bookId, animateTarget) {
+  if (!animateTarget) return false;
+  if (animateTarget instanceof Set) return animateTarget.has(bookId);
+  return bookId === animateTarget;
+}
+
+function makeDisplayBooks(subjectFilter, gradeFilter, sortOrder, solvedFilter, animateBookId) {
+  const listElement = document.getElementById("card-area");
+  const loadingText = document.getElementById("loading-text");
+
+  listElement.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+
+  const sortIndex = sortOrder === "updated" ? 8 : 7;
+  const sortedEntries = Object.entries(bookCache).sort(([bookIdA], [bookIdB]) => {
+    const bookA = bookCache[bookIdA];
+    const bookB = bookCache[bookIdB];
+    const recruitingDiff = (liveSessionsCache[bookIdB] ? 1 : 0) - (liveSessionsCache[bookIdA] ? 1 : 0);
+    if (recruitingDiff !== 0) return recruitingDiff;
+    return (bookB[sortIndex] || 0) - (bookA[sortIndex] || 0);
+  });
+
+  sortedEntries.forEach(([bookId, book]) => {
+    
+    const card = document.createElement("div");
+    card.classList.add("card");
+    card.dataset.bookId = bookId;
+    if (shouldHighlightCard(bookId, animateBookId)) card.classList.add("just-started-card");
+
+    const isPrivate = !!book[10];
+    const session = liveSessionsCache[bookId];
+    const isRecruiting = !!session;
+    const isWaiting = isRecruiting && session.status === "waiting";
+    let recruitBubble = null;
+    if (isWaiting) {
+      // ★ 募集中は、カードの外側(上)に吹き出し風のバブルを添える形で表示する
+      recruitBubble = buildRecruitBubble(session);
+    } else if (isPrivate || isRecruiting) {
+      const privateBadge = document.createElement("span");
+      privateBadge.classList.add("private-badge");
+      if (isRecruiting) {
+        privateBadge.classList.add("started-badge");
+        privateBadge.textContent = "開始済み";
+      } else {
+        privateBadge.textContent = "非公開";
+      }
+      card.appendChild(privateBadge);
+    }
+      
+    const cardTop = document.createElement("div");
+    cardTop.classList.add("card-top");
+    const subjectBadge = document.createElement("span");
+    subjectBadge.classList.add("badge");
+    subjectBadge.classList.add(`t${book[2]}`);
+    subjectBadge.textContent = subjectIdList[book[2]];
+    const gradeBadge = document.createElement("span");
+    gradeBadge.classList.add("badge");
+    gradeBadge.classList.add(`t${book[2]}`);
+    gradeBadge.textContent = gradeIdList[book[3]];
+    const wordCountBadge = document.createElement("span");
+    wordCountBadge.classList.add("badge");
+    wordCountBadge.classList.add(`t${book[2]}`);
+    wordCountBadge.innerHTML = `${STACK_ICON_SVG}${book[4]}問`;
+    cardTop.appendChild(subjectBadge);
+    cardTop.appendChild(gradeBadge);
+    cardTop.appendChild(wordCountBadge);
+      
+    const cardTitle = document.createElement("p");
+    cardTitle.classList.add("card-title");
+    cardTitle.textContent = book[0];
+      
+    const cardDescription = document.createElement("p");
+    cardDescription.classList.add("card-description");
+    cardDescription.textContent = book[1];
+      
+    const cardMadeBy = document.createElement("span");
+    cardMadeBy.classList.add("card-madeBy");
+      
+    const makerCached = getUserCache(book[5]) || {};
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = makerCached.name;
+    nameSpan.classList.add("clickable-user");
+    if (makerCached.isAdmin) {
+      nameSpan.classList.add("admin");
+    } else if (hasActivePrize(makerCached)) {
+      nameSpan.classList.add("prize");
+    }
+    nameSpan.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openProfileModal(book[5]);
+    });
+    const madeByTextContent = document.createTextNode('作成者: ');
+    cardMadeBy.appendChild(madeByTextContent);
+    cardMadeBy.appendChild(nameSpan);
+      
+    const solvedByArea = buildSolvedByArea(bookId, book, isWaiting, session);
+    const datesArea = buildDatesArea(book[7], book[8]);
+
+    card.addEventListener("click", () => {
+      openSettingModal(bookId);
+    });
+      
+      
+    card.appendChild(cardTop);
+    card.appendChild(cardTitle);
+    card.appendChild(cardDescription);
+    card.appendChild(cardMadeBy);
+    card.appendChild(datesArea);
+    if (solvedByArea) card.appendChild(solvedByArea);
+    
+    const subjectMatches = subjectFilter === "all" || book[2] === Number(subjectFilter);
+    const gradeMatches = gradeFilter === "all" || book[3] === Number(gradeFilter);
+    const hasSolved = (book[6] || []).includes(myUserId);
+    const solvedMatches =
+      !solvedFilter ||
+      solvedFilter === "all" ||
+      (solvedFilter === "solved" && hasSolved) ||
+      (solvedFilter === "unsolved" && !hasSolved);
+    if (subjectMatches && gradeMatches && solvedMatches) {
+      if (recruitBubble) {
+        const cardWrapper = document.createElement("div");
+        cardWrapper.classList.add("card-wrapper");
+        cardWrapper.appendChild(recruitBubble);
+        cardWrapper.appendChild(card);
+        fragment.appendChild(cardWrapper);
+      } else {
+        fragment.appendChild(card);
+      }
+    }
+  });
+  
+  const makeBookButton = document.createElement("button");
+    makeBookButton.classList.add("card");
+    makeBookButton.classList.add("make-card");
+    makeBookButton.innerHTML = `
+    <svg xmlns="http://w3.org" viewBox="0 0 24 24" width="24" height="24">
+      <circle cx="12" cy="12" r="10" fill="currentColor"/>
+      <path d="M 12,8 L 12,16 M 8,12 L 16,12" 
+        fill="none" 
+        stroke="white" 
+        stroke-width="2" 
+        stroke-linecap="round"/>
+    </svg>
+    <p class="card-title">問題集を作成</p>`;
+    makeBookButton.addEventListener("click", () => {
+      window.location.href = "./make.html";
+    });
+  
+    loadingText.classList.add("hidden");
+    listElement.classList.remove("hidden");
+    listElement.appendChild(makeBookButton);
+    listElement.appendChild(fragment);
+}
+
+function makeDisplayCards(subjectFilter, gradeFilter, sortOrder, solvedFilter) {
+  const listElement = document.getElementById("card-area");
+  const loadingText = document.getElementById("loading-text");
+
+  listElement.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+
+  const sortIndex = sortOrder === "updated" ? 8 : 7;
+  const sortedEntries = Object.entries(deckCache).sort(
+    ([, deckA], [, deckB]) => (deckB[sortIndex] || 0) - (deckA[sortIndex] || 0)
+  );
+
+  sortedEntries.forEach(([deckId, deck]) => {
+    const card = document.createElement("div");
+    card.classList.add("card");
+
+    const isPrivate = !!deck[10];
+    if (isPrivate) {
+      const privateBadge = document.createElement("span");
+      privateBadge.classList.add("private-badge");
+      privateBadge.textContent = "非公開";
+      card.appendChild(privateBadge);
+    }
+
+    const cardTop = document.createElement("div");
+    cardTop.classList.add("card-top");
+    const subjectBadge = document.createElement("span");
+    subjectBadge.classList.add("badge");
+    subjectBadge.classList.add(`t${deck[2]}`);
+    subjectBadge.textContent = subjectIdList[deck[2]];
+    const gradeBadge = document.createElement("span");
+    gradeBadge.classList.add("badge");
+    gradeBadge.classList.add(`t${deck[2]}`);
+    gradeBadge.textContent = gradeIdList[deck[3]];
+    const cardCountBadge = document.createElement("span");
+    cardCountBadge.classList.add("badge");
+    cardCountBadge.classList.add(`t${deck[2]}`);
+    cardCountBadge.innerHTML = `${STACK_ICON_SVG}${deck[4]}枚`;
+    cardTop.appendChild(subjectBadge);
+    cardTop.appendChild(gradeBadge);
+    cardTop.appendChild(cardCountBadge);
+
+    const cardTitle = document.createElement("p");
+    cardTitle.classList.add("card-title");
+    cardTitle.textContent = deck[0];
+
+    const cardDescription = document.createElement("p");
+    cardDescription.classList.add("card-description");
+    cardDescription.textContent = deck[1];
+
+    const cardMadeBy = document.createElement("span");
+    cardMadeBy.classList.add("card-madeBy");
+
+    const makerCached = getUserCache(deck[5]) || {};
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = makerCached.name;
+    nameSpan.classList.add("clickable-user");
+    if (makerCached.isAdmin) {
+      nameSpan.classList.add("admin");
+    } else if (hasActivePrize(makerCached)) {
+      nameSpan.classList.add("prize");
+    }
+    nameSpan.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openProfileModal(deck[5]);
+    });
+    const madeByTextContent = document.createTextNode('作成者: ');
+    cardMadeBy.appendChild(madeByTextContent);
+    cardMadeBy.appendChild(nameSpan);
+
+    const solvedBy = deck[6] || [];
+    const solvedByArea = buildSolvedByArea(deckId, deck, false, null, "card");
+    const datesArea = buildDatesArea(deck[7], deck[8]);
+
+    card.addEventListener("click", () => {
+      openCardSettingModal(deckId);
+    });
+
+    card.appendChild(cardTop);
+    card.appendChild(cardTitle);
+    card.appendChild(cardDescription);
+    card.appendChild(cardMadeBy);
+    card.appendChild(datesArea);
+    card.appendChild(solvedByArea);
+
+    const subjectMatches = subjectFilter === "all" || deck[2] === Number(subjectFilter);
+    const gradeMatches = gradeFilter === "all" || deck[3] === Number(gradeFilter);
+    const hasSolved = solvedBy.includes(myUserId);
+    const solvedMatches =
+      !solvedFilter ||
+      solvedFilter === "all" ||
+      (solvedFilter === "solved" && hasSolved) ||
+      (solvedFilter === "unsolved" && !hasSolved);
+    if (subjectMatches && gradeMatches && solvedMatches) {
+      fragment.appendChild(card);
+    }
+  });
+
+  const makeCardDeckButton = document.createElement("button");
+  makeCardDeckButton.classList.add("card");
+  makeCardDeckButton.classList.add("make-card");
+  makeCardDeckButton.innerHTML = `
+  <svg xmlns="http://w3.org" viewBox="0 0 24 24" width="24" height="24">
+    <circle cx="12" cy="12" r="10" fill="currentColor"/>
+    <path d="M 12,8 L 12,16 M 8,12 L 16,12" 
+      fill="none" 
+      stroke="white" 
+      stroke-width="2" 
+      stroke-linecap="round"/>
+  </svg>
+  <p class="card-title">暗記カードを作成</p>`;
+  makeCardDeckButton.addEventListener("click", () => {
+    window.location.href = "./makeCard.html";
+  });
+
+  loadingText.classList.add("hidden");
+  listElement.classList.remove("hidden");
+  listElement.appendChild(makeCardDeckButton);
+  listElement.appendChild(fragment);
+}
+
+let shareModalBtn;
+let shareModal;
+let shareModalClose;
+document.addEventListener("DOMContentLoaded", () => {
+  shareModalBtn = document.getElementById("share-modal-btn");
+  shareModal = document.getElementById("share-modal");
+  shareModalClose = document.getElementById("share-modal-close");
+
+  shareModalBtn.addEventListener("click", () => {
+    shareModal.classList.remove("hidden");
+  });
+  shareModalClose.addEventListener("click", () => {
+    shareModal.classList.add("hidden");
+  });
+});
+
+let settingModal;
+let settingModalClose;
+let settingModalBookId;
+let settingModalSubject,
+  settingModalGrade,
+  settingModalCount,
+  settingModalCountText;
+let settingModalTitle, settingModalDescription, settingModalMadeByName;
+let settingSolvedByContainer;
+let settingModalEditButton, settingModalStartButton, viewImpressionsButton;
+let shuffleProblemsToggle;
+let shuffleToggleRow, flipToggleRow, flipCardsToggle;
+let favoriteOnlyToggleRow, favoriteOnlyToggle, favoriteOnlyToggleLabel;
+let settingModalType = "book";
+let recruitCommentArea, recruitCommentText, recruitStartOpenButton, joinButton, joinDisabledText;
+let recruitCommentEditButton, recruitCommentEditArea, recruitCommentEditInput, recruitCommentSaveButton, recruitCommentCancelButton;
+let isEditingRecruitComment = false;
+let recruitStartModal, recruitStartModalClose, recruitCommentInput, recruitStartConfirmButton, recruitStartModalTitle;
+let specialLiveToggleRow, specialLiveToggle;
+let soloStartButton;
+document.addEventListener("DOMContentLoaded", () => {
+  settingModal = document.getElementById("setting-modal");
+  settingModalClose = document.getElementById("setting-modal-close");
+  settingModalSubject = document.getElementById("setting-subject");
+  settingModalGrade = document.getElementById("setting-grade");
+  settingModalCount = document.getElementById("setting-count");
+  settingModalCountText = document.getElementById("setting-count-text");
+  settingModalTitle = document.getElementById("setting-title");
+  settingModalDescription = document.getElementById("setting-description");
+  settingModalMadeByName = document.getElementById("setting-madeBy-name");
+  settingSolvedByContainer = document.getElementById("setting-solved-by-container");
+  settingModalStartButton = document.getElementById("start-button");
+  settingModalEditButton = document.getElementById("edit-button");
+  viewImpressionsButton = document.getElementById("view-impressions-button");
+  shuffleProblemsToggle = document.getElementById("shuffle-problems-toggle");
+  shuffleToggleRow = document.getElementById("shuffle-toggle-row");
+  flipToggleRow = document.getElementById("flip-toggle-row");
+  flipCardsToggle = document.getElementById("flip-cards-toggle");
+  favoriteOnlyToggleRow = document.getElementById("favorite-only-toggle-row");
+  favoriteOnlyToggle = document.getElementById("favorite-only-toggle");
+  favoriteOnlyToggleLabel = document.getElementById("favorite-only-toggle-label");
+  recruitCommentArea = document.getElementById("recruit-comment-area");
+  recruitCommentText = document.getElementById("recruit-comment-text");
+  recruitCommentEditButton = document.getElementById("recruit-comment-edit-button");
+  recruitCommentEditArea = document.getElementById("recruit-comment-edit-area");
+  recruitCommentEditInput = document.getElementById("recruit-comment-edit-input");
+  recruitCommentSaveButton = document.getElementById("recruit-comment-save-button");
+  recruitCommentCancelButton = document.getElementById("recruit-comment-cancel-button");
+  recruitStartOpenButton = document.getElementById("recruit-start-open-button");
+  joinButton = document.getElementById("join-button");
+  joinDisabledText = document.getElementById("join-disabled-text");
+  recruitStartModal = document.getElementById("recruit-start-modal");
+  recruitStartModalClose = document.getElementById("recruit-start-modal-close");
+  recruitStartModalTitle = document.getElementById("recruit-start-modal-title");
+  recruitCommentInput = document.getElementById("recruit-comment-input");
+  recruitStartConfirmButton = document.getElementById("recruit-start-confirm-button");
+  specialLiveToggleRow = document.getElementById("special-live-toggle-row");
+  specialLiveToggle = document.getElementById("special-live-toggle");
+  soloStartButton = document.getElementById("solo-start-button");
+
+  settingModalClose.addEventListener("click", () => {
+    settingModal.classList.add("hidden");
+    resetHashToCurrentType();
+    settingModalSubject.textContent = "不明";
+    settingModalGrade.textContent = "不明";
+    settingModalCountText.textContent = "--問";
+    for (let i = 0; i < 9; i++) {
+      settingModalSubject.classList.remove(`t${i + 1}`);
+      settingModalGrade.classList.remove(`t${i + 1}`);
+      settingModalCount.classList.remove(`t${i + 1}`);
+    }
+    settingModalSubject.classList.add("t0");
+    settingModalGrade.classList.add("t0");
+    settingModalCount.classList.add("t0");
+
+    settingModalTitle.textContent = "loading...";
+    settingModalDescription.textContent = "loading...";
+    settingModalMadeByName.textContent = "loading...";
+    settingModalMadeByName.classList.remove("admin");
+    settingModalMadeByName.classList.remove("prize");
+    settingSolvedByContainer.innerHTML = "";
+
+    settingModalEditButton.classList.add("hidden");
+    flipCardsToggle.checked = false;
+
+    recruitCommentArea.classList.add("hidden");
+    recruitStartOpenButton.classList.add("hidden");
+    recruitStartOpenButton.textContent = "みんなで解く";
+    isEditingRecruitComment = false;
+    recruitCommentEditButton.classList.add("hidden");
+    recruitCommentEditArea.classList.add("hidden");
+    recruitCommentText.classList.remove("hidden");
+    joinButton.classList.add("hidden");
+    joinButton.classList.remove("leave-mode");
+    joinButton.classList.remove("split-primary");
+    joinDisabledText.classList.add("hidden");
+    settingModalStartButton.classList.remove("hidden");
+    settingModalStartButton.classList.remove("full-width-button");
+    settingModalStartButton.classList.remove("live-gradient-button");
+    settingModalStartButton.classList.remove("split-primary");
+    settingModalStartButton.textContent = "スタート";
+    soloStartButton.classList.add("hidden");
+    soloStartButton.classList.remove("split-secondary");
+    shuffleToggleRow.classList.remove("hidden");
+  });
+
+  recruitStartOpenButton.addEventListener("click", () => {
+    recruitCommentInput.value = "";
+    recruitStartConfirmButton.disabled = false;
+    recruitStartConfirmButton.textContent = "募集を開始";
+    recruitStartModalClose.classList.remove("hidden");
+    specialLiveToggle.checked = false;
+    const currentBook = bookCache[settingModalBookId];
+    const isPrivateBook = !!(currentBook && currentBook[10]);
+    // ★ 解き直し(公開済みの問題集の再募集)の場合は、スペシャルライブのトグルを出さない
+    // ★ 管理者なら、公開済みの問題集を「解き直す」場合でもスペシャルライブにできる
+    specialLiveToggleRow.classList.toggle("hidden", !meIsAdmin);
+    recruitStartModalTitle.textContent = isPrivateBook ? "みんなで解く" : "みんなで解き直す";
+    recruitStartModal.classList.remove("hidden");
+  });
+  recruitStartModalClose.addEventListener("click", () => {
+    recruitStartModal.classList.add("hidden");
+  });
+
+  // ★ 募集中の問題集を、主催者が募集コメントだけ後から編集できるようにする
+  recruitCommentEditButton.addEventListener("click", () => {
+    const session = liveSessionsCache[settingModalBookId];
+    recruitCommentEditInput.value = (session && session.recruitComment) || "";
+    isEditingRecruitComment = true;
+    recruitCommentText.classList.add("hidden");
+    recruitCommentEditButton.classList.add("hidden");
+    recruitCommentEditArea.classList.remove("hidden");
+    recruitCommentEditInput.focus();
+  });
+  recruitCommentCancelButton.addEventListener("click", () => {
+    isEditingRecruitComment = false;
+    recruitCommentEditArea.classList.add("hidden");
+    recruitCommentText.classList.remove("hidden");
+    recruitCommentEditButton.classList.remove("hidden");
+  });
+  recruitCommentSaveButton.addEventListener("click", async () => {
+    const newComment = recruitCommentEditInput.value.trim();
+    recruitCommentSaveButton.disabled = true;
+    recruitCommentCancelButton.disabled = true;
+    try {
+      await rtdbSet(rtdbRef(rtdb, `liveSessions/${settingModalBookId}/recruitComment`), newComment);
+      isEditingRecruitComment = false;
+      recruitCommentText.textContent = newComment || "(コメントはありません)";
+      recruitCommentEditArea.classList.add("hidden");
+      recruitCommentText.classList.remove("hidden");
+      recruitCommentEditButton.classList.remove("hidden");
+    } catch (error) {
+      console.error("募集コメントの更新に失敗しました:", error);
+      await AppDialog.alert("募集コメントの更新に失敗しました。\n" + error);
+    } finally {
+      recruitCommentSaveButton.disabled = false;
+      recruitCommentCancelButton.disabled = false;
+    }
+  });
+  recruitStartConfirmButton.addEventListener("click", async () => {
+    const bookId = settingModalBookId;
+    if (!bookId || !bookCache[bookId]) return;
+    const comment = recruitCommentInput.value.trim();
+    const timeLimitSeconds = DEFAULT_RECRUIT_TIME_LIMIT_SECONDS; // ★ 待機画面(liveHost.html)側で主催者が変更可能
+    const isSpecial = meIsAdmin && specialLiveToggle.checked; // ★ スペシャルライブ(景品つき)は管理者のみ設定可能
+
+    recruitStartConfirmButton.disabled = true;
+    recruitStartConfirmButton.textContent = "セッションを作成中…";
+    recruitStartModalClose.classList.add("hidden");
+    try {
+      await rtdbSet(rtdbRef(rtdb, `liveSessions/${bookId}`), {
+        hostUserId: myUserId,
+        status: "waiting",
+        timeLimitSeconds,
+        totalQuestions: bookCache[bookId][4] || 0,
+        recruitComment: comment,
+        isSpecial,
+        currentQuestionIndex: -1,
+        currentQuestion: null,
+        currentAnswerKey: null,
+        locked: false,
+        participants: {},
+        answers: {},
+        totalScores: {},
+        createdAt: rtdbServerTimestamp()
+      });
+      // ★ liveSessionsCacheはattachLiveSessionsListener()のchild_addedで自動更新されるが、
+      //   モーダルの再表示はそれを待たず即座に行いたいのでここでも反映しておく
+      liveSessionsCache[bookId] = {
+        hostUserId: myUserId,
+        status: "waiting",
+        timeLimitSeconds,
+        recruitComment: comment,
+        isSpecial,
+        participants: {}
+      };
+      recruitStartModal.classList.add("hidden");
+      openSettingModal(bookId);
+      handleFilterChange();
+
+      // ★ 通知の送信は結果を待たず(awaitせず)、本来の処理を遅らせないようにする
+      const recruitBookTitle = (bookCache[bookId] && bookCache[bookId][0]) || "問題集";
+      sendPushToAllOthers(db, {
+        senderId: myUserId,
+        title: "みんなで解く・募集開始",
+        body: `${(getUserCache(myUserId) && getUserCache(myUserId).name) || myUserId}さんが「${recruitBookTitle}」の募集を開始しました。`,
+        url: "./app.html",
+        topic: `live-recruit-${bookId}`
+      });
+    } catch (error) {
+      console.error(error);
+      await AppDialog.alert("募集の開始に失敗しました。");
+    } finally {
+      recruitStartConfirmButton.disabled = false;
+      recruitStartConfirmButton.textContent = "募集を開始";
+      recruitStartModalClose.classList.remove("hidden");
+    }
+  });
+
+  joinButton.addEventListener("click", async () => {
+    const bookId = settingModalBookId;
+    if (!bookId || !bookCache[bookId]) return;
+    const session = liveSessionsCache[bookId];
+    const participants = (session && session.participants) || {};
+    const alreadyJoined = Object.prototype.hasOwnProperty.call(participants, myUserId);
+
+    if (alreadyJoined) {
+      // ★ 既に参加済みの場合はそのまま待機画面(解答画面)へ移動するだけ
+      window.location.href = `./liveAnswer.html?id=${bookId}`;
+      return;
+    }
+
+    joinButton.disabled = true;
+    try {
+      const statusSnap = await rtdbGet(rtdbRef(rtdb, `liveSessions/${bookId}/status`));
+      const status = statusSnap.exists() ? statusSnap.val() : null;
+      if (status !== "waiting") {
+        joinButton.classList.add("hidden");
+        joinDisabledText.classList.remove("hidden");
+        return;
+      }
+
+      const myCached = getUserCache(myUserId) || {};
+      await rtdbSet(rtdbRef(rtdb, `liveSessions/${bookId}/participants/${myUserId}`), {
+        name: myCached.name || myUserId,
+        joinedAt: rtdbServerTimestamp()
+      });
+      window.location.href = `./liveAnswer.html?id=${bookId}`;
+    } catch (error) {
+      console.error(error);
+      await AppDialog.alert("参加処理に失敗しました。");
+      joinButton.disabled = false;
+    }
+  });
+  settingModalStartButton.addEventListener("click", () => {
+    const favoritesParam = favoriteOnlyToggle.checked && !favoriteOnlyToggle.disabled ? "&favoritesOnly=1" : "";
+    if (settingModalType === "card") {
+      const flipParam = flipCardsToggle.checked && !flipCardsToggle.disabled ? "&flip=1" : "";
+      window.location.href = `./answerCard.html?id=${settingModalBookId}${flipParam}${favoritesParam}`;
+    } else if (liveSessionsCache[settingModalBookId]) {
+      // ★ 募集中の問題集は、主催者用のライブ進行画面へ(お気に入り絞り込みは対象外)
+      window.location.href = `./liveHost.html?id=${settingModalBookId}`;
+    } else {
+      const shuffleParam = shuffleProblemsToggle.checked && !shuffleProblemsToggle.disabled ? "&shuffle=1" : "";
+      window.location.href = `./answer.html?id=${settingModalBookId}${shuffleParam}${favoritesParam}`;
+    }
+  });
+  // ★ 募集中でも一人で解けるようにするための「スタート」ボタン。ライブセッションを無視して通常の解答画面へ
+  soloStartButton.addEventListener("click", () => {
+    const shuffleParam = shuffleProblemsToggle.checked && !shuffleProblemsToggle.disabled ? "&shuffle=1" : "";
+    const favoritesParam = favoriteOnlyToggle.checked && !favoriteOnlyToggle.disabled ? "&favoritesOnly=1" : "";
+    window.location.href = `./answer.html?id=${settingModalBookId}${shuffleParam}${favoritesParam}`;
+  });
+  settingModalEditButton.addEventListener("click", () => {
+    const editPage = settingModalType === "card" ? "editCard.html" : "edit.html";
+    window.location.href = `./${editPage}?id=${settingModalBookId}`;
+  });
+  settingModalMadeByName.addEventListener("click", () => {
+    const cache = settingModalType === "card" ? deckCache : bookCache;
+    openProfileModal(cache[settingModalBookId][5]);
+  });
+  viewImpressionsButton.addEventListener("click", () => {
+    openImpressionsModal(settingModalBookId, settingModalType);
+  });
+});
+
+// ★ 出題設定モーダルの表示内容を「問題集」「暗記カード」で切り替える
+function setSettingModalMode(mode) {
+  settingModalType = mode;
+  const isCard = mode === "card";
+
+  shuffleToggleRow.classList.toggle("hidden", isCard);
+  flipToggleRow.classList.toggle("hidden", !isCard);
+  favoriteOnlyToggleRow.classList.remove("hidden");
+  favoriteOnlyToggle.checked = false;
+  favoriteOnlyToggleLabel.textContent = isCard ? "お気に入りの暗記カードだけを解く" : "お気に入りの問題だけを解く";
+
+  settingModalEditButton.classList.add("hidden");
+  viewImpressionsButton.classList.remove("hidden");
+  settingModalShareButton.classList.remove("hidden");
+
+  recruitCommentArea.classList.add("hidden");
+  recruitStartOpenButton.classList.add("hidden");
+  recruitStartOpenButton.textContent = "みんなで解く";
+  isEditingRecruitComment = false;
+  recruitCommentEditButton.classList.add("hidden");
+  recruitCommentEditArea.classList.add("hidden");
+  recruitCommentText.classList.remove("hidden");
+  joinButton.classList.add("hidden");
+  joinButton.classList.remove("leave-mode");
+  joinButton.classList.remove("split-primary");
+  joinDisabledText.classList.add("hidden");
+  settingModalStartButton.classList.remove("hidden");
+  settingModalStartButton.classList.remove("full-width-button");
+  settingModalStartButton.classList.remove("live-gradient-button");
+  settingModalStartButton.classList.remove("split-primary");
+  settingModalStartButton.textContent = "スタート";
+  soloStartButton.classList.add("hidden");
+  soloStartButton.classList.remove("split-secondary");
+}
+
+function openSettingModal(id) {
+  setSettingModalMode("book");
+  settingModalBookId = id;
+  settingModal.classList.remove("hidden");
+  setBookHash(id);
+  settingModalTitle.textContent = bookCache[id][0];
+  settingModalDescription.textContent = bookCache[id][1];
+  settingModalSubject.classList.remove("t0");
+  settingModalGrade.classList.remove("t0");
+  settingModalCount.classList.remove("t0");
+  settingModalSubject.classList.add(`t${bookCache[id][2]}`);
+  settingModalGrade.classList.add(`t${bookCache[id][2]}`);
+  settingModalCount.classList.add(`t${bookCache[id][2]}`);
+  settingModalSubject.textContent = subjectIdList[bookCache[id][2]];
+  settingModalGrade.textContent = gradeIdList[bookCache[id][3]];
+  settingModalCountText.textContent = `${bookCache[id][4]}問`;
+  const makerCached = getUserCache(bookCache[id][5]) || {};
+  settingModalMadeByName.textContent = makerCached.name;
+  settingModalMadeByName.classList.toggle("admin", !!makerCached.isAdmin);
+  settingModalMadeByName.classList.toggle("prize", !makerCached.isAdmin && hasActivePrize(makerCached));
+
+  if (bookCache[id][5] === myUserId || meIsAdmin) settingModalEditButton.classList.remove("hidden");
+
+  const allowShuffle = !!bookCache[id][9];
+  // ★ シャッフル可能な問題集は、初期状態でシャッフルをオンにしておく
+  shuffleProblemsToggle.checked = allowShuffle;
+  shuffleProblemsToggle.disabled = !allowShuffle;
+
+  applyRecruitModeToSettingModal(id);
+}
+
+// ★ 「みんなで解く」募集中かどうかで出題設定モーダルの表示を切り替える（問題集のみ対象）
+// ★ 「みんなで解く」募集中かどうかで出題設定モーダルの表示を切り替える（問題集のみ対象）
+//   liveSessionsCache はRTDBのリアルタイム監視で常に最新化されているので、ここでは同期的に判定できる
+function applyRecruitModeToSettingModal(id) {
+  const book = bookCache[id];
+  const isMaker = book[5] === myUserId;
+  const isPrivate = !!book[10];
+  const session = liveSessionsCache[id];
+  const isRecruiting = !!session;
+  const isCurrentlyWaiting = isRecruiting && session.status === "waiting";
+
+  // ★ カード一覧と同じ「解いた人」/「参加者」のアバター一覧を、問題集モーダルにも表示する
+  settingSolvedByContainer.innerHTML = "";
+  settingSolvedByContainer.appendChild(buildDatesArea(book[7], book[8]));
+  settingSolvedByContainer.appendChild(buildSolvedByArea(id, book, isCurrentlyWaiting, session));
+
+  recruitCommentArea.classList.add("hidden");
+  recruitStartOpenButton.classList.add("hidden");
+  recruitStartOpenButton.textContent = "みんなで解く";
+  joinButton.classList.add("hidden");
+  joinButton.classList.remove("leave-mode");
+  joinButton.classList.remove("split-primary");
+  joinDisabledText.classList.add("hidden");
+  settingModalStartButton.classList.remove("hidden");
+  settingModalStartButton.classList.remove("full-width-button");
+  settingModalStartButton.classList.remove("live-gradient-button");
+  settingModalStartButton.classList.remove("split-primary");
+  settingModalStartButton.textContent = "スタート";
+  soloStartButton.classList.add("hidden");
+  soloStartButton.classList.remove("split-secondary");
+  shuffleToggleRow.classList.remove("hidden");
+  favoriteOnlyToggleRow.classList.remove("hidden");
+  // ★ 編集中(isEditingRecruitComment)の場合は、再描画のたびに編集用UIを勝手に閉じてしまわないようにする
+  if (!isEditingRecruitComment) {
+    recruitCommentEditButton.classList.add("hidden");
+    recruitCommentEditArea.classList.add("hidden");
+    recruitCommentText.classList.remove("hidden");
+  }
+
+  if (isRecruiting) {
+    // 募集中は編集・感想を隠す。シェアは残す
+    settingModalEditButton.classList.add("hidden");
+    viewImpressionsButton.classList.add("hidden");
+
+    recruitCommentArea.classList.remove("hidden");
+    if (!isEditingRecruitComment) {
+      recruitCommentText.textContent = session.recruitComment || "(コメントはありません)";
+    }
+
+    // ★ 募集中の「スタート」(一人で解く)は、公開済みの問題集の時だけ出す。
+    //   非公開の問題集は元々「みんなで解く」専用の問題集なので、募集中は従来通りライブ関連のボタンのみにする。
+    //   公開済みの問題集は普通に(一人で)解けるので、シャッフル/お気に入り絞り込みトグルも通常通り出す
+    const showSoloStart = !isPrivate;
+    if (showSoloStart) {
+      soloStartButton.classList.remove("hidden");
+    } else {
+      shuffleToggleRow.classList.add("hidden");
+      favoriteOnlyToggleRow.classList.add("hidden");
+    }
+
+    if (isMaker) {
+      // 主催者: 待機画面(進行管理)へ ＋ (公開済みなら)一人で解く(スタート)
+      settingModalStartButton.classList.remove("hidden");
+      settingModalStartButton.textContent = "待機画面へ";
+      joinButton.classList.add("hidden");
+      // ★ 主催者なら、募集中でも募集コメントを後から編集できるようにする
+      if (!isEditingRecruitComment) {
+        recruitCommentEditButton.classList.remove("hidden");
+      }
+      if (showSoloStart) {
+        settingModalStartButton.classList.add("split-primary", "live-gradient-button");
+        soloStartButton.classList.add("split-secondary");
+      } else {
+        settingModalStartButton.classList.add("full-width-button", "live-gradient-button");
+      }
+    } else {
+      // 参加者: 参加する/待機画面へ ＋ (公開済みなら)一人で解く(スタート)。
+      // 既に開始済み(waiting以外)かつ未参加の場合は参加ボタンのみ出せず、一人で解くボタンだけ表示する
+      settingModalStartButton.classList.add("hidden");
+
+      const participants = session.participants || {};
+      const alreadyJoined = Object.prototype.hasOwnProperty.call(participants, myUserId);
+
+      joinButton.classList.remove("hidden");
+      joinButton.disabled = false;
+      if (alreadyJoined) {
+        joinButton.textContent = "待機画面へ";
+        if (showSoloStart) {
+          joinButton.classList.add("split-primary");
+          soloStartButton.classList.add("split-secondary");
+        }
+      } else if (session.status === "waiting") {
+        joinButton.textContent = "参加する";
+        if (showSoloStart) {
+          joinButton.classList.add("split-primary");
+          soloStartButton.classList.add("split-secondary");
+        }
+      } else {
+        joinButton.classList.add("hidden");
+        joinDisabledText.classList.remove("hidden");
+        // ★ 参加できない状態でも、公開済みなら一人で解くボタンは単独(幅100%)で表示する
+      }
+    }
+  } else {
+    viewImpressionsButton.classList.remove("hidden");
+    if (isMaker) {
+      // ★ 公開済みの問題集でも、作成者なら「みんなで解き直す」として募集を開始できる
+      recruitStartOpenButton.classList.remove("hidden");
+      recruitStartOpenButton.textContent = isPrivate ? "みんなで解く" : "みんなで解き直す";
+    }
+  }
+
+  // ★ 編集ボタンと参加ボタンが両方隠れているなら、スタートボタンは常に横幅100%にする
+  //   (隣接セレクタでのwidth切り替えはjoin-buttonが間に挟まると効かないため、ここでまとめて判定する)
+  //   募集中は split-primary / split-secondary で幅を制御するので、この自動判定は対象外にする
+  if (!isRecruiting) {
+    const editHidden = settingModalEditButton.classList.contains("hidden");
+    const joinHidden = joinButton.classList.contains("hidden");
+    if (!settingModalStartButton.classList.contains("hidden")) {
+      settingModalStartButton.classList.toggle("full-width-button", editHidden && joinHidden);
+    }
+  }
+}
+
+function openCardSettingModal(id) {
+  setSettingModalMode("card");
+  settingModalBookId = id;
+  settingModal.classList.remove("hidden");
+  setBookHash(id);
+  settingModalTitle.textContent = deckCache[id][0];
+  settingModalDescription.textContent = deckCache[id][1];
+  settingModalSubject.classList.remove("t0");
+  settingModalGrade.classList.remove("t0");
+  settingModalCount.classList.remove("t0");
+  settingModalSubject.classList.add(`t${deckCache[id][2]}`);
+  settingModalGrade.classList.add(`t${deckCache[id][2]}`);
+  settingModalCount.classList.add(`t${deckCache[id][2]}`);
+  settingModalSubject.textContent = subjectIdList[deckCache[id][2]];
+  settingModalGrade.textContent = gradeIdList[deckCache[id][3]];
+  settingModalCountText.textContent = `${deckCache[id][4]}枚`;
+  const makerCached = getUserCache(deckCache[id][5]) || {};
+  settingModalMadeByName.textContent = makerCached.name;
+  settingModalMadeByName.classList.toggle("admin", !!makerCached.isAdmin);
+  settingModalMadeByName.classList.toggle("prize", !makerCached.isAdmin && hasActivePrize(makerCached));
+
+  if (deckCache[id][5] === myUserId || meIsAdmin) settingModalEditButton.classList.remove("hidden");
+
+  // ★ 問題集モーダルと同じく、暗記カードモーダルにも「解いた人」を表示する(暗記カードには募集中の概念が無い)
+  settingSolvedByContainer.innerHTML = "";
+  settingSolvedByContainer.appendChild(buildDatesArea(deckCache[id][7], deckCache[id][8]));
+  settingSolvedByContainer.appendChild(buildSolvedByArea(id, deckCache[id], false, null, "card"));
+
+  const allowFlip = !!deckCache[id][9];
+  flipCardsToggle.checked = false;
+  flipCardsToggle.disabled = !allowFlip;
+
+  // ★ 編集ボタンが出ない(自分の暗記カードでない)場合は、スタートボタンを横幅いっぱいに広げる
+  //   (問題集側のapplyRecruitModeToSettingModalと同様の判定。暗記カードには募集中の概念が無いのでjoinButtonは常に非表示)
+  const editHidden = settingModalEditButton.classList.contains("hidden");
+  settingModalStartButton.classList.toggle("full-width-button", editHidden);
+}
+
+// ★ URLのハッシュ(#問題集ID)を使った出題設定モーダルの直リンク対応
+function setBookHash(bookId) {
+  if (window.location.hash === `#${bookId}`) return;
+  const newUrl = `${window.location.pathname}${window.location.search}#${bookId}`;
+  history.pushState(null, "", newUrl);
+}
+// ★ 「#books」「#cards」は一覧の種類そのものを表すハッシュとして扱う。
+//   モーダルを閉じた時などは、個別ID(#問題集ID)からこちらに戻す
+function resetHashToCurrentType() {
+  const target = `#${contentTypeSelect.value === "cards" ? "cards" : "books"}`;
+  if (window.location.hash === target) return;
+  const newUrl = `${window.location.pathname}${window.location.search}${target}`;
+  history.replaceState(null, "", newUrl);
+}
+// ★ 起動時、URLハッシュに応じて表示する一覧の種類・開くモーダルを決める。
+//   #books / #cards ならその一覧を表示するだけ、それ以外は問題集/暗記カードIDとみなし、
+//   該当する一覧をバックで表示したうえで、そのモーダルを開く
+function initializeViewFromHash() {
+  const hash = window.location.hash.replace("#", "");
+
+  if (hash === "cards") {
+    contentTypeSelect.value = "cards";
+    makeDisplayCards("all", "all", sortOrderSelect.value, "all");
+    return;
+  }
+  if (hash === "books") {
+    contentTypeSelect.value = "books";
+    makeDisplayBooks("all", "all", sortOrderSelect.value, "all");
+    return;
+  }
+
+  if (bookCache[hash]) {
+    contentTypeSelect.value = "books";
+    makeDisplayBooks("all", "all", sortOrderSelect.value, "all");
+    openSettingModal(hash);
+  } else if (deckCache[hash]) {
+    contentTypeSelect.value = "cards";
+    makeDisplayCards("all", "all", sortOrderSelect.value, "all");
+    openCardSettingModal(hash);
+  } else {
+    // ★ 該当データが無い(存在しないID/権限がない等)場合は、通常の問題集一覧にフォールバックする
+    contentTypeSelect.value = "books";
+    makeDisplayBooks("all", "all", sortOrderSelect.value, "all");
+    resetHashToCurrentType();
+  }
+}
+
+let bookShareModal;
+let bookShareModalClose;
+let bookShareQr;
+let bookShareUrl;
+let settingModalShareButton;
+document.addEventListener("DOMContentLoaded", () => {
+  bookShareModal = document.getElementById("book-share-modal");
+  bookShareModalClose = document.getElementById("book-share-modal-close");
+  bookShareQr = document.getElementById("book-share-qr");
+  bookShareUrl = document.getElementById("book-share-url");
+  settingModalShareButton = document.getElementById("setting-modal-share-button");
+
+  bookShareModalClose.addEventListener("click", () => {
+    bookShareModal.classList.add("hidden");
+  });
+  settingModalShareButton.addEventListener("click", () => {
+    openBookShareModal(settingModalBookId);
+  });
+});
+
+function openBookShareModal(bookId) {
+  const targetUrl = new URL(`app.html#${bookId}`, window.location.href).href;
+  bookShareUrl.textContent = targetUrl;
+  bookShareQr.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(targetUrl)}`;
+  bookShareModal.classList.remove("hidden");
+}
+
+let solvedModal;
+let solvedModalClose;
+let solvedModalTitle;
+let solvedArea;
+document.addEventListener("DOMContentLoaded", () => {
+  solvedModal = document.getElementById("solved-modal");
+  solvedModalClose = document.getElementById("solved-modal-close");
+  solvedModalTitle = document.getElementById("solved-modal-title");
+  solvedArea = document.getElementById("solved-area");
+
+  solvedModalClose.addEventListener("click", () => {
+    solvedModal.classList.add("hidden");
+  });
+});
+
+function openSolvedModal(id, type) {
+  solvedArea.innerHTML = "";
+
+  let userIds;
+  let emptyMessage;
+
+  if (type === "participants") {
+    const session = liveSessionsCache[id];
+    userIds = session ? Object.keys(session.participants || {}) : [];
+    solvedModalTitle.textContent = "参加者";
+    emptyMessage = "まだ参加者がいません";
+  } else {
+    const cache = type === "card" ? deckCache : bookCache;
+    userIds = (cache[id] && cache[id][6]) || [];
+    solvedModalTitle.textContent = "解いた人";
+    emptyMessage = "まだ誰も解いていません";
+  }
+
+  if (userIds.length === 0) {
+    const emptyMessageEl = document.createElement("p");
+    emptyMessageEl.textContent = emptyMessage;
+    solvedArea.appendChild(emptyMessageEl);
+  } else {
+    userIds.forEach(userId => {
+      const item = document.createElement("div");
+      item.classList.add("member-item");
+
+      const left = document.createElement("div");
+      left.classList.add("member-left");
+
+      const cached = getUserCache(userId) || {};
+      const avatar = createAvatar(cached.name, "small", cached.imageUrl);
+      left.appendChild(avatar);
+
+      const nameSpan = document.createElement("span");
+      nameSpan.classList.add("member-name");
+      nameSpan.textContent = cached.name || "不明なユーザー";
+      if (cached.isAdmin) {
+        nameSpan.classList.add("admin");
+      } else if (hasActivePrize(cached)) {
+        nameSpan.classList.add("prize");
+      }
+      left.appendChild(nameSpan);
+
+      item.appendChild(left);
+      item.addEventListener("click", () => {
+        openProfileModal(userId);
+      });
+      solvedArea.appendChild(item);
+    });
+  }
+
+  solvedModal.classList.remove("hidden");
+}
+
+// ★ 日時を「yyyy/mm/dd hh:mm」形式の文字列に整形するヘルパー
+function formatDateTime(date) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  const hh = String(date.getHours()).padStart(2, "0");
+  const min = String(date.getMinutes()).padStart(2, "0");
+  return `${yyyy}/${mm}/${dd} ${hh}:${min}`;
+}
+
+// ★ 作成日時・更新日時の表示形式。管理者は時刻まで(YYYY/MM/DD HH:MM)、一般ユーザーは日付のみ(YYYY/MM/DD)
+function formatContentDate(millis) {
+  if (!millis) return "不明";
+  const date = new Date(millis);
+  if (meIsAdmin) return formatDateTime(date);
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  return `${yyyy}/${mm}/${dd}`;
+}
+
+// ★ 問題集一覧のカードと問題集モーダルの両方で使う、作成日時・更新日時の表示部品
+function buildDatesArea(createdAtMillis, updatedAtMillis) {
+  const datesArea = document.createElement("p");
+  datesArea.classList.add("card-dates");
+
+  const createdLabel = document.createElement("span");
+  createdLabel.classList.add("card-dates-label");
+  createdLabel.textContent = "作成: ";
+  datesArea.appendChild(createdLabel);
+  datesArea.appendChild(document.createTextNode(formatContentDate(createdAtMillis) + "　"));
+
+  const updatedLabel = document.createElement("span");
+  updatedLabel.classList.add("card-dates-label");
+  updatedLabel.textContent = "更新: ";
+  datesArea.appendChild(updatedLabel);
+  datesArea.appendChild(document.createTextNode(formatContentDate(updatedAtMillis)));
+
+  return datesArea;
+}
+
+let userListModal;
+let userListModalClose;
+let userListArea;
+document.addEventListener("DOMContentLoaded", () => {
+  userListModal = document.getElementById("user-list-modal");
+  userListModalClose = document.getElementById("user-list-modal-close");
+  userListArea = document.getElementById("user-list-area");
+
+  userListModalClose.addEventListener("click", () => {
+    userListModal.classList.add("hidden");
+  });
+});
+
+// ★ 管理者向け：全ユーザーをno順に一覧表示し、右端に最終確認日時を表示する
+async function openUserListModal() {
+  userListArea.innerHTML = "";
+  const loadingMessage = document.createElement("p");
+  loadingMessage.textContent = "読み込み中...";
+  userListArea.appendChild(loadingMessage);
+  userListModal.classList.remove("hidden");
+
+  try {
+    const usersSnap = await getDocs(query(collection(db, "users_random"), orderBy("no")));
+    userListArea.innerHTML = "";
+
+    if (usersSnap.empty) {
+      const emptyMessage = document.createElement("p");
+      emptyMessage.textContent = "ユーザーが見つかりません";
+      userListArea.appendChild(emptyMessage);
+      return;
+    }
+
+    usersSnap.forEach(doc => {
+      const userId = doc.id;
+      const userData = doc.data();
+      const name = userData.name || "名前未設定";
+      const isAdmin = !!userData.isAdmin;
+      const imageUrl = userData.imageUrl || "";
+
+      // 他の画面のキャッシュとも整合するよう更新しておく
+      setUserCache(userId, {
+        name,
+        isAdmin,
+        imageUrl,
+        profileText: userData.profileText || "",
+        prizeGrantedAt: toMillisOrNull(userData.prizeGrantedAt)
+      });
+
+      const item = document.createElement("div");
+      item.classList.add("member-item");
+
+      const left = document.createElement("div");
+      left.classList.add("member-left");
+
+      const avatar = createAvatar(name, "small", imageUrl);
+      left.appendChild(avatar);
+
+      const nameSpan = document.createElement("span");
+      nameSpan.classList.add("member-name");
+      nameSpan.textContent = name;
+      if (isAdmin) {
+        nameSpan.classList.add("admin");
+      } else if (hasActivePrize(getUserCache(userId))) {
+        nameSpan.classList.add("prize");
+      }
+      left.appendChild(nameSpan);
+
+      item.appendChild(left);
+
+      const lastCheckedSpan = document.createElement("span");
+      lastCheckedSpan.classList.add("member-last-checked");
+      lastCheckedSpan.textContent = userData.lastOpenedAt
+        ? formatDateTime(userData.lastOpenedAt.toDate())
+        : "未確認";
+      item.appendChild(lastCheckedSpan);
+
+      item.addEventListener("click", () => {
+        openProfileModal(userId);
+      });
+
+      userListArea.appendChild(item);
+    });
+  } catch (error) {
+    console.error("ユーザー一覧の取得エラー:", error);
+    userListArea.innerHTML = "";
+    const errorMessage = document.createElement("p");
+    errorMessage.textContent = "ユーザー一覧の取得に失敗しました。\n" + error;
+    userListArea.appendChild(errorMessage);
+  }
+}
+
+let profileModal;
+let profileModalClose;
+let profileAvatarWrap;
+let profileAvatarHolder;
+let profileAvatarInput;
+let profileAvatarRemoveButton;
+let profileName;
+let profileNameInput;
+let profileText;
+let profileTextEdit;
+let profileEditButton;
+let profileCancelButton;
+let isProfileEditing = false;
+let currentProfileUserId = "";
+let canEditCurrentProfile = false;
+let profileAvatarCurrentUrl = "";
+let profileAvatarFile = null;
+let profileAvatarRemoved = false;
+
+document.addEventListener("DOMContentLoaded", () => {
+  profileModal = document.getElementById("profile-modal");
+  profileModalClose = document.getElementById("profile-modal-close");
+  profileAvatarWrap = document.querySelector(".profile-avatar-wrap");
+  profileAvatarHolder = document.getElementById("profile-avatar-holder");
+  profileAvatarInput = document.getElementById("profile-avatar-input");
+  profileAvatarRemoveButton = document.getElementById("profile-avatar-remove-button");
+  profileName = document.getElementById("profile-name");
+  profileNameInput = document.getElementById("profile-name-input");
+  profileText = document.getElementById("profile-text");
+  profileTextEdit = document.getElementById("profile-text-edit");
+  profileEditButton = document.getElementById("profile-edit-button");
+  profileCancelButton = document.getElementById("profile-cancel-button");
+
+  profileModalClose.addEventListener("click", () => {
+    profileModal.classList.add("hidden");
+    resetProfileEditMode();
+  });
+
+  profileEditButton.addEventListener("click", handleProfileEditOrSave);
+  profileCancelButton.addEventListener("click", () => {
+    resetProfileEditMode();
+  });
+
+  // アイコンをタップ（編集モード中のみ有効）→ ファイル選択を開く
+  profileAvatarHolder.addEventListener("click", () => {
+    if (!isProfileEditing || !canEditCurrentProfile) return;
+    profileAvatarInput.click();
+  });
+
+  // ファイルが選択されたらプレビューに反映（アップロードは保存時にまとめて行う）
+  profileAvatarInput.addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    profileAvatarFile = file;
+    profileAvatarRemoved = false;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      profileAvatarHolder.innerHTML = "";
+      const img = document.createElement("img");
+      img.classList.add("avatar-circle", "large");
+      img.src = event.target.result;
+      profileAvatarHolder.appendChild(img);
+      profileAvatarRemoveButton.classList.remove("hidden");
+    };
+    reader.readAsDataURL(file);
+  });
+
+  // 「画像を削除」→ プレビューを頭文字アバターに戻し、保存時に画像を消去
+  profileAvatarRemoveButton.addEventListener("click", () => {
+    profileAvatarFile = null;
+    profileAvatarRemoved = true;
+    profileAvatarInput.value = "";
+
+    profileAvatarHolder.innerHTML = "";
+    const nameForInitial = isProfileEditing ? profileNameInput.value : profileName.textContent;
+    profileAvatarHolder.appendChild(createAvatar(nameForInitial, "large"));
+    profileAvatarRemoveButton.classList.add("hidden");
+  });
+});
+
+// 編集モードをリセットする関数
+function resetProfileEditMode() {
+  isProfileEditing = false;
+  if (profileEditButton) {
+    profileEditButton.textContent = "プロフィールを編集";
+    profileEditButton.disabled = false;
+  }
+  if (profileCancelButton) profileCancelButton.classList.add("hidden");
+  if (profileName) profileName.classList.remove("hidden");
+  if (profileNameInput) profileNameInput.classList.add("hidden");
+  if (profileText) profileText.classList.remove("hidden");
+  if (profileTextEdit) profileTextEdit.classList.add("hidden");
+
+  if (profileAvatarWrap) profileAvatarWrap.classList.remove("editable");
+  if (profileAvatarRemoveButton) profileAvatarRemoveButton.classList.add("hidden");
+  profileAvatarFile = null;
+  profileAvatarRemoved = false;
+  if (profileAvatarHolder && profileName) {
+    profileAvatarHolder.innerHTML = "";
+    profileAvatarHolder.appendChild(createAvatar(profileName.textContent, "large", profileAvatarCurrentUrl));
+  }
+}
+
+// 編集ボタン・保存ボタンが押された時の処理
+async function handleProfileEditOrSave() {
+  if (!isProfileEditing) {
+    isProfileEditing = true;
+    profileEditButton.textContent = "プロフィールを保存";
+    if (profileCancelButton) profileCancelButton.classList.toggle("hidden", !canEditCurrentProfile);
+
+    const cached = getUserCache(currentProfileUserId) || {};
+    const currentName = cached.name || "";
+    const currentText = cached.profileText || "";
+
+    profileName.classList.add("hidden");
+    profileNameInput.classList.remove("hidden");
+    profileNameInput.value = currentName;
+
+    profileText.classList.add("hidden");
+    profileTextEdit.classList.remove("hidden");
+    profileTextEdit.value = currentText;
+
+    // アイコンをタップして変更できるようにする（自分／管理者のみ）
+    if (canEditCurrentProfile) {
+      profileAvatarWrap.classList.add("editable");
+      if (profileAvatarCurrentUrl) {
+        profileAvatarRemoveButton.classList.remove("hidden");
+      }
+    }
+
+  } else {
+    const newName = profileNameInput.value.trim();
+    const newProfileText = profileTextEdit.value.trim();
+
+    if (!newName) {
+      await AppDialog.alert("ユーザーネームを入力してください。");
+      return;
+    }
+
+    profileEditButton.disabled = true;
+    profileEditButton.textContent = "保存中...";
+
+    try {
+      let finalImageUrl = profileAvatarCurrentUrl;
+      if (profileAvatarFile) {
+        profileEditButton.textContent = "画像をアップロード中...";
+        finalImageUrl = await uploadImageToImgbb(profileAvatarFile);
+      } else if (profileAvatarRemoved) {
+        finalImageUrl = "";
+      }
+
+      profileEditButton.textContent = "保存中...";
+
+      await setDoc(doc(db, "users_random", currentProfileUserId), {
+          name: newName,
+          profileText: newProfileText,
+          imageUrl: finalImageUrl
+        },
+        { merge: true });
+
+      const previousCache = getUserCache(currentProfileUserId) || {};
+      const updated = setUserCache(currentProfileUserId, {
+        name: newName,
+        isAdmin: previousCache.isAdmin || false,
+        imageUrl: finalImageUrl,
+        profileText: newProfileText,
+        prizeGrantedAt: previousCache.prizeGrantedAt || null
+      });
+
+      if (currentProfileUserId === myUserId) {
+        drawerUsername.textContent = newName;
+      }
+
+      profileName.textContent = newName;
+      profileText.textContent = newProfileText || "ステータスメッセージはありません。";
+
+      profileAvatarCurrentUrl = finalImageUrl;
+      profileAvatarFile = null;
+      profileAvatarRemoved = false;
+      profileAvatarHolder.innerHTML = "";
+      profileAvatarHolder.appendChild(createAvatar(newName, "large", updated.imageUrl));
+
+      profileName.classList.toggle("admin", !!updated.isAdmin);
+      profileName.classList.toggle("prize", !updated.isAdmin && hasActivePrize(updated));
+
+      resetProfileEditMode();
+      await AppDialog.alert("プロフィールを保存しました。");
+    } catch (error) {
+      console.error("プロフィール保存エラー:", error);
+      await AppDialog.alert("プロフィールの保存に失敗しました: " + error.message);
+      profileEditButton.disabled = false;
+      profileEditButton.textContent = "プロフィールを保存";
+    }
+  }
+}
+
+// プロフィールモーダルを開く関数。キャッシュにステータスメッセージまで揃っていれば再取得しない
+async function openProfileModal(userId, startEditMode = false) {
+  currentProfileUserId = userId;
+  canEditCurrentProfile = meIsAdmin || userId === myUserId;
+  resetProfileEditMode();
+
+  const cached = getUserCache(userId);
+  const hasCachedProfileText = !!cached && cached.profileText !== undefined;
+  profileName.textContent = (cached && cached.name) || "取得中...";
+  profileName.classList.toggle("admin", !!(cached && cached.isAdmin));
+  profileName.classList.toggle("prize", !!cached && !cached.isAdmin && hasActivePrize(cached));
+  profileText.textContent = hasCachedProfileText
+    ? (cached.profileText || "ステータスメッセージはありません。")
+    : "取得中...";
+  profileAvatarCurrentUrl = (cached && cached.imageUrl) || "";
+
+  profileAvatarHolder.innerHTML = "";
+  profileAvatarHolder.appendChild(createAvatar(profileName.textContent, "large", profileAvatarCurrentUrl));
+
+  profileEditButton.classList.toggle("hidden", !canEditCurrentProfile);
+  profileModal.classList.remove("hidden");
+
+  // すでにステータスメッセージまでキャッシュ済みなら、Firestoreへは再取得しに行かない
+  if (hasCachedProfileText) {
+    if (canEditCurrentProfile && startEditMode) handleProfileEditOrSave();
+    return;
+  }
+
+  try {
+    const userSnapshot = await hedged(() => getDoc(doc(db, "users_random", userId)));
+    if (userSnapshot.exists()) {
+      const userData = userSnapshot.data();
+      const updated = setUserCache(userId, {
+        name: userData.name || "名前未設定",
+        isAdmin: userData.isAdmin || false,
+        imageUrl: userData.imageUrl || "",
+        profileText: userData.profileText || "",
+        prizeGrantedAt: toMillisOrNull(userData.prizeGrantedAt)
+      });
+
+      profileName.textContent = updated.name;
+      profileName.classList.toggle("admin", !!updated.isAdmin);
+      profileName.classList.toggle("prize", !updated.isAdmin && hasActivePrize(updated));
+      profileText.textContent = updated.profileText || "ステータスメッセージはありません。";
+      profileAvatarCurrentUrl = updated.imageUrl || "";
+
+      profileAvatarHolder.innerHTML = "";
+      profileAvatarHolder.appendChild(createAvatar(profileName.textContent, "large", profileAvatarCurrentUrl));
+
+      if (canEditCurrentProfile && startEditMode) handleProfileEditOrSave();
+    } else {
+      profileName.textContent = "不明なユーザー";
+      profileText.textContent = "";
+    }
+  } catch (error) {
+    console.error("プロフィール取得エラー:", error);
+    profileName.textContent = "エラー";
+    profileText.textContent = "プロフィールの取得に失敗しました。";
+  }
+}
+
+let impressionsModal;
+let impressionsModalClose;
+let impressionsArea;
+document.addEventListener("DOMContentLoaded", () => {
+  impressionsModal = document.getElementById("impressions-modal");
+  impressionsModalClose = document.getElementById("impressions-modal-close");
+  impressionsArea = document.getElementById("impressions-area");
+
+  impressionsModalClose.addEventListener("click", () => {
+    impressionsModal.classList.add("hidden");
+  });
+});
+
+function getContentDocRef(id, type) {
+  const topDoc = type === "card" ? "cards" : "books";
+  return doc(db, "ProblemPosting", topDoc, "data", id);
+}
+
+async function openImpressionsModal(bookId, type) {
+  impressionsArea.innerHTML = "<p>読み込み中...</p>";
+  impressionsModal.classList.remove("hidden");
+
+  try {
+    const bookSnap = await getContentDocRef(bookId, type).get();
+    const impressions = (bookSnap.exists() && bookSnap.data().impressions) || {};
+    const entries = Object.entries(impressions).filter(([, text]) => text && text.trim() !== "");
+
+    impressionsArea.innerHTML = "";
+
+    if (entries.length === 0) {
+      const emptyMessage = document.createElement("p");
+      emptyMessage.textContent = "まだ感想はありません";
+      impressionsArea.appendChild(emptyMessage);
+      return;
+    }
+
+    await Promise.all(entries.map(([userId]) => ensureUserCached(userId)));
+
+    entries.forEach(([userId, text]) => {
+      const cached = getUserCache(userId) || {};
+
+      const card = document.createElement("div");
+      card.classList.add("impression-card");
+
+      const header = document.createElement("div");
+      header.classList.add("impression-card-header");
+
+      const avatar = createAvatar(cached.name, "small", cached.imageUrl);
+      header.appendChild(avatar);
+
+      const nameSpan = document.createElement("span");
+      nameSpan.classList.add("impression-card-name", "clickable-user");
+      nameSpan.textContent = cached.name || "不明なユーザー";
+      if (cached.isAdmin) {
+        nameSpan.classList.add("admin");
+      } else if (hasActivePrize(cached)) {
+        nameSpan.classList.add("prize");
+      }
+      nameSpan.addEventListener("click", () => {
+        openProfileModal(userId);
+      });
+      header.appendChild(nameSpan);
+
+      if (userId === myUserId || meIsAdmin) {
+        const editButton = document.createElement("button");
+        editButton.type = "button";
+        editButton.classList.add("impression-card-edit-button");
+        editButton.textContent = "編集";
+        editButton.addEventListener("click", () => {
+          openImpressionEditModal(bookId, type, userId, text);
+        });
+        header.appendChild(editButton);
+      }
+
+      const textP = document.createElement("p");
+      textP.classList.add("impression-card-text");
+      textP.textContent = text;
+
+      card.appendChild(header);
+      card.appendChild(textP);
+      impressionsArea.appendChild(card);
+    });
+  } catch (error) {
+    console.error("感想の取得エラー:", error);
+    impressionsArea.innerHTML = "<p>感想の取得に失敗しました。</p>";
+  }
+}
+
+let impressionEditModal;
+let impressionEditModalClose;
+let impressionEditInput;
+let impressionEditSaveButton;
+let impressionEditBookId = "";
+let impressionEditType = "book";
+let impressionEditTargetUserId = "";
+document.addEventListener("DOMContentLoaded", () => {
+  impressionEditModal = document.getElementById("impression-edit-modal");
+  impressionEditModalClose = document.getElementById("impression-edit-modal-close");
+  impressionEditInput = document.getElementById("impression-edit-input");
+  impressionEditSaveButton = document.getElementById("impression-edit-save-button");
+
+  impressionEditModalClose.addEventListener("click", () => {
+    impressionEditModal.classList.add("hidden");
+  });
+  impressionEditSaveButton.addEventListener("click", saveImpressionEdit);
+});
+
+function openImpressionEditModal(bookId, type, userId, existingText) {
+  impressionEditBookId = bookId;
+  impressionEditType = type;
+  impressionEditTargetUserId = userId;
+  impressionEditInput.value = existingText || "";
+  impressionEditModal.classList.remove("hidden");
+}
+
+async function saveImpressionEdit() {
+  const text = impressionEditInput.value.trim();
+
+  impressionEditSaveButton.disabled = true;
+  impressionEditSaveButton.textContent = "保存中...";
+
+  try {
+    await getContentDocRef(impressionEditBookId, impressionEditType).update({
+      [`impressions.${impressionEditTargetUserId}`]: text
+    });
+
+    impressionEditModal.classList.add("hidden");
+    await openImpressionsModal(impressionEditBookId, impressionEditType);
+  } catch (error) {
+    console.error("感想の保存エラー:", error);
+    await AppDialog.alert("感想の保存に失敗しました。\n" + error);
+  } finally {
+    impressionEditSaveButton.disabled = false;
+    impressionEditSaveButton.textContent = "保存する";
+  }
+}
